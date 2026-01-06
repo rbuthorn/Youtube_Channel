@@ -35,6 +35,103 @@ OPENAI_API_KEY = None  # Will use os.getenv('OPENAI_API_KEY') or command-line ar
 thumbnail_prompt_template = "Create an epic ultrarealistic cinematic-style thumbnail image for a video with the description: {description}. The image must be safe, appropriate, and comply with OpenAI content policies: no violence, hate, adult content, illegal activity, or copyrighted characters."
 master_image_prompt_template = "Create the most hyperrealistic, ultra-detailed, high-quality, photorealistic reference frame image possible for a video with the description: {description}. The image must be extremely realistic and lifelike, as if photographed by a professional documentary photographer, with maximum detail, photorealism, and natural lighting. Make it look like a real photograph, not an illustration or artwork. The image must comply with OpenAI content policies: no violence, hate, adult content, illegal activity, copyrighted characters, or likenesses of real people. Use generic, artistic representations only, but make them appear completely realistic and photographic."
 
+def analyze_script_for_reference_images(script, video_prompt, api_key=None, model='gpt-4o'):
+    """
+    Analyze script to determine what set of reference images should be created for visual consistency.
+    For example, if the video is about Blackbeard, it might need: his face and his ship.
+    
+    Args:
+        script: The full script text
+        video_prompt: The original video prompt/topic
+        api_key: OpenAI API key
+        model: Model to use (default: 'gpt-4o')
+        
+    Returns:
+        List of dictionaries, each with 'id', 'type' ('character' or 'subject'), 'description', 'image_prompt', and 'reasoning'
+    """
+    if not OPENAI_AVAILABLE:
+        raise ImportError("openai library is required. Install with: pip install openai")
+    
+    # Initialize OpenAI client
+    if api_key is None:
+        api_key = os.getenv('OPENAI_API_KEY')
+    if api_key is None:
+        api_key = OPENAI_API_KEY
+    
+    client = OpenAI(api_key=api_key)
+    
+    analysis_prompt = f"""Analyze this script to determine what reference images should be created for visual consistency across all video segments.
+
+Video topic: {video_prompt}
+
+Full script: {script[:2000]}{'...' if len(script) > 2000 else ''}
+
+Think about what visual elements need to remain consistent throughout the video. For example:
+- If the video is about a person's life history, you might need: their face/character and important locations/objects
+- If the video is about a historical event, you might need: key characters and important locations/objects
+- If the video is about a place, you might need: the location and key objects/features
+
+Output JSON array:
+[
+    {{
+        "id": "ref_1",
+        "type": "character" or "subject",
+        "description": "Clear description of what this reference image represents (e.g., 'Blackbeard's face', 'Blackbeard's ship Queen Anne's Revenge')",
+        "image_prompt": "Detailed DALL-E prompt for the most hyperrealistic, ultra-detailed, photorealistic image possible, as if photographed by a professional documentary photographer. Generic enough to avoid copyright, specific enough for consistency. Make it look like a real photograph with natural lighting, realistic textures, and lifelike detail. MUST comply with OpenAI content policy: no violence, hate, adult content, illegal activity, copyrighted characters, or likenesses of real, living people. Use generic, artistic representations only, but make them appear completely realistic and photographic with maximum detail and photorealism.",
+        "reasoning": "Why this reference image is needed for visual consistency"
+    }}
+]
+
+Rules:
+- Identify 1-4 reference images that are most critical for visual consistency
+- Character type = specific person/character that appears throughout (e.g., "Blackbeard's face", "Napoleon's appearance")
+- Subject type = important locations, objects, or visual elements (e.g., "Blackbeard's ship", "battlefield location", "ancient temple")
+- Each reference image should be something that appears in multiple segments and needs to look identical across all videos
+- image_prompt MUST be safe, appropriate, and comply with OpenAI DALL-E content policies
+- NEVER include likenesses of living people or celebrities. Historical non-living figures (Napoleon, Blackbeard, Cleopatra, etc.) are okay.
+- Avoid: violence, hate speech, adult content, illegal activities, living people, copyrighted characters, weapons, gore
+- Use: generic, artistic, educational, and appropriate visual descriptions
+- Be specific enough that the same reference image can be used consistently, but generic enough to avoid copyright issues
+
+Provide ONLY valid JSON array:"""
+    
+    try:
+        response = client.responses.create(
+            model=model,
+            input=[
+                {"role": "system", "content": "Video production assistant. Analyze scripts to determine what set of reference images should be created for visual consistency across video segments. Identify the most important visual elements (characters, locations, objects) that need to remain consistent throughout the video. Create detailed, hyperrealistic image prompts that comply with OpenAI content policies. CRITICAL: All images must be hyperrealistic and photorealistic, as if photographed by a professional documentary photographer - make them look like real photographs with natural lighting, realistic textures, and maximum detail. Never create prompts with likenesses of real people, celebrities, or historical figures. Always use generic, artistic, stylized representations, but make them appear completely realistic and photographic. Ensure all image prompts comply with OpenAI content policies: no violence, hate, adult content, illegal activity, copyrighted characters, or real person likenesses."},
+                {"role": "user", "content": analysis_prompt}
+            ],
+            max_output_tokens=20000,
+            temperature=1
+        )
+        
+        import json
+        reference_images = json.loads(response.output_text)
+        
+        # Ensure it's a list
+        if isinstance(reference_images, dict):
+            reference_images = [reference_images]
+        
+        # Validate and add default id if missing
+        for i, ref_img in enumerate(reference_images):
+            if 'id' not in ref_img:
+                ref_img['id'] = f"ref_{i+1}"
+        
+        return reference_images
+        
+    except Exception as e:
+        print(f"⚠️  Script analysis for reference images failed: {e}")
+        # Fallback: return single general reference image
+        return [{
+            "id": "ref_1",
+            "type": "subject",
+            "description": f"Visual representation of {video_prompt}",
+            "image_prompt": f"The most hyperrealistic, ultra-detailed, photorealistic reference image possible representing {video_prompt}, as if photographed by a professional documentary photographer, suitable for video generation, with maximum detail, natural lighting, realistic textures, and lifelike quality. Make it look like a real photograph, not an illustration.",
+            "reasoning": "Analysis failed, defaulting to general subject"
+        }]
+
+
 def analyze_script_for_reference_image(script, video_prompt, api_key=None, model='gpt-4o'):
     """
     Analyze script to determine what reference image is needed (main character or general subject).
@@ -106,9 +203,11 @@ Provide ONLY valid JSON:"""
         }
 # NOTE: Script generation is now separated into three distinct steps:
 # 1. generate_script_from_prompt() - Generates the overarching script (separate API call)
-# 2. segment_script_rule_based() - Segments the script into X segments using rules-based approach
-# 3. generate_sora_prompts_from_segments() - Generates Sora 2 prompts from segments (separate API calls)
+# 2. segment_script_by_narration() - Segments the script into 12-second segments based on narration audio timing (uses Whisper API)
+#    Falls back to segment_script_rule_based() if narration is not available
+# 3. generate_sora_prompts_from_segments() - Generates Sora 2 prompts from narration-based segments (separate API calls)
 # This separation allows for better control, error handling, and modularity.
+# The narration-based segmentation ensures segments align with actual 12-second narration windows rather than word count.
 
 
 def find_ffmpeg():
@@ -413,6 +512,7 @@ def clean_script_for_tts(script):
     """
     Clean script to ensure it contains ONLY dialogue, [MUSICAL BREAK], and [VISUAL BREAK].
     Removes any labels, instructions, or extra text that would be read as dialogue by TTS.
+    Also formats years (e.g., "2025" -> "20 25") so TTS reads them correctly.
     
     Args:
         script: The script text to clean
@@ -465,6 +565,18 @@ def clean_script_for_tts(script):
     import re
     # Keep only [MUSICAL BREAK] and [VISUAL BREAK], remove other bracket patterns
     script = re.sub(r'\[(?!MUSICAL BREAK|VISUAL BREAK)[^\]]+\]', '', script)
+    
+    # Format years: Replace 4-digit years (1000-2099) with space-separated versions
+    # Pattern: word boundary, 4 digits (1000-2099), word boundary
+    # This ensures we only match standalone years, not parts of larger numbers
+    def format_year(match):
+        year = match.group(0)
+        # Split into two 2-digit parts
+        return f"{year[:2]} {year[2:]}"
+    
+    # Match years between 1000 and 2099 (reasonable year range)
+    # Use word boundaries to avoid matching years within larger numbers
+    script = re.sub(r'\b(1[0-9]{3}|20[0-9]{2})\b', format_year, script)
     
     return script
 
@@ -540,14 +652,13 @@ def generate_and_save_narration(script_file_path=None, narration_audio_path=None
     print("="*60 + "\n")
     
     try:
-        voiceover_audio_path, original_voiceover_backup = generate_voiceover_with_music(
+        # Stitch narration files from folder
+        voiceover_audio_path, _ = generate_voiceover_from_folder(
             script=script,
             output_path=narration_audio_path,
-            api_key=api_key,
-            voice='onyx',  # Deep, manly male voice
-            music_style='cinematic',
-            music_volume=0.10,  # 10% volume for background music
-            duration=duration
+            narration_folder=None,  # Uses 'narration_segments' folder in current directory
+            break_duration=1000,  # 1 second for breaks
+            music_volume=0.07  # 7% volume for background music
         )
         
         print(f"\n✅ Narration audio saved to: {narration_audio_path}")
@@ -610,16 +721,14 @@ def generate_script_from_prompt(video_prompt, duration=8, api_key=None, model='g
     print(f"Total duration: {duration} seconds")
     
     # Create a simplified prompt for script generation only
-    # Estimate: average reading speed is ~150-160 words per minute, or ~2.5 words per second
-    # Narration should be shorter than video by at most 5 seconds (for opening/closing shots)
-    # For {duration} seconds video, narration should be ~{duration - 3} seconds (3s buffer for shots)
-    # Aim for approximately {int((duration - 3) * 2.3)} words (slightly conservative)
-    narration_duration = max(1, duration - 3)  # At least 1 second, but typically 3 seconds shorter
-    estimated_words = int(narration_duration * 2.3)
+    # Calculate target character count: 900 characters per minute of video
+    # Convert duration from seconds to minutes
+    duration_minutes = duration / 60.0
+    target_characters = int(duration_minutes * 900)
     
-    script_prompt = f"""Create a {duration}-second documentary-style YouTube script (~{estimated_words} words) for: {video_prompt}
+    script_prompt = f"""Create a {duration}-second documentary-style YouTube script (approximately {target_characters} characters) for: {video_prompt}
 
-IMPORTANT: The narration should be approximately {narration_duration} seconds long (video is {duration} seconds). This allows for 2-3 second opening and closing shots with no narration.
+IMPORTANT: The script should be approximately {target_characters} characters long (900 characters per minute of video). This allows for 2-3 second opening and closing shots with no narration.
 
 CRITICAL ASSUMPTION: Assume the viewer knows NOTHING about this topic. Provide comprehensive context, background, and explanations throughout.
 
@@ -644,17 +753,19 @@ REQUIREMENTS:
   * Conclusion (10-15%): How it ended and immediate aftermath. Explain the consequences
   * Impact (5-10%): Lasting significance, consequences, and why it matters. Connect to broader historical or cultural context
 - Musical breaks and visual moments:
-  * Include strategic pauses marked with [MUSICAL BREAK] or [VISUAL BREAK] where narration stops
+  * CRITICAL: Include a [MUSICAL BREAK] or [VISUAL BREAK] after no more than every 2000 characters of narration
+  * This ensures regular pacing and prevents narration from becoming too dense
   * Place these breaks after dramatic moments, before transitions, or during visually stunning scenes
   * These breaks should be 2-4 seconds long - let the visuals and music tell part of the story
   * Flow: narration → pause/musical break → narration continues naturally
   * Use breaks to build tension, emphasize key moments, or transition between story sections
+  * Count characters carefully: after every 2000 characters of narration text, you MUST include a break
 - Style: Informative yet engaging. Blend facts with storytelling. Use natural pauses (...), varied pacing, and smooth transitions
 - Tone: Authoritative but accessible - like a knowledgeable expert sharing a fascinating story to someone who's never heard it before
 - Be educational and explanatory - prioritize clarity and understanding over brevity
 - Provide context continuously - don't just state facts, explain them
 - Make it entertaining without sacrificing accuracy - facts should be compelling on their own
-- One continuous script, ~{estimated_words} words
+- One continuous script, approximately {target_characters} characters (900 characters per minute of video)
 
 CRITICAL OUTPUT REQUIREMENTS:
 - Output ONLY the script text itself
@@ -671,7 +782,7 @@ Provide ONLY the script text:"""
         response = client.responses.create(
             model=model,
             input=[
-                {"role": "system", "content": "Expert documentary scriptwriter. Write informative, historically accurate scripts that tell complete stories in an engaging way. Structure content with hook, introduction, narrative, climax, conclusion, and impact. Blend factual accuracy with compelling storytelling - like BBC or National Geographic documentaries. Be authoritative yet accessible, informative yet entertaining. CRITICAL: Assume the viewer knows NOTHING about the topic. Provide extensive context, background, and explanations throughout. Explain who people are, what terms mean, when/where events occurred, why they happened, and the historical/cultural context. Don't assume prior knowledge - explain everything clearly and thoroughly. Include strategic musical breaks marked with [MUSICAL BREAK] or [VISUAL BREAK] where narration stops for 2-4 seconds to let visuals and music shine. These breaks should flow naturally - place them after dramatic moments, before transitions, or during visually stunning scenes. Cover the full story comprehensively with rich context and explanations. CRITICAL: Output ONLY the script text - dialogue/narration, [MUSICAL BREAK], and [VISUAL BREAK] markers only. NO labels, NO instructions, NO explanations. The output will be read directly by text-to-speech, so any extra text will be spoken as dialogue."},
+                {"role": "system", "content": "Expert documentary scriptwriter. Write informative, historically accurate scripts that tell complete stories in an engaging way. Structure content with hook, introduction, narrative, climax, conclusion, and impact. Blend factual accuracy with compelling storytelling - like BBC or National Geographic documentaries. Be authoritative yet accessible, informative yet entertaining. CRITICAL: Assume the viewer knows NOTHING about the topic. Provide extensive context, background, and explanations throughout. Explain who people are, what terms mean, when/where events occurred, why they happened, and the historical/cultural context. Don't assume prior knowledge - explain everything clearly and thoroughly. CRITICAL BREAK REQUIREMENT: You MUST include a [MUSICAL BREAK] or [VISUAL BREAK] after no more than every 2000 characters of narration text. Count characters carefully and ensure breaks occur regularly to maintain pacing. Include strategic musical breaks marked with [MUSICAL BREAK] or [VISUAL BREAK] where narration stops for 2-4 seconds to let visuals and music shine. These breaks should flow naturally - place them after dramatic moments, before transitions, or during visually stunning scenes, but ALWAYS ensure they occur at least every 2000 characters. Cover the full story comprehensively with rich context and explanations. CRITICAL: Output ONLY the script text - dialogue/narration, [MUSICAL BREAK], and [VISUAL BREAK] markers only. NO labels, NO instructions, NO explanations. The output will be read directly by text-to-speech, so any extra text will be spoken as dialogue."},
                 {"role": "user", "content": script_prompt}
             ],
             max_output_tokens=max_tokens,
@@ -696,6 +807,7 @@ def segment_script_rule_based(script, num_segments):
     """
     STEP 2: Segment a script into N segments using rule-based approach (word count).
     This uses a rules-based system to divide the script evenly by word count.
+    DEPRECATED: Use segment_script_by_narration instead for narration-based segmentation.
     
     Args:
         script: The complete overarching script
@@ -721,6 +833,187 @@ def segment_script_rule_based(script, num_segments):
         segments.append(segment_text)
     
     return segments
+
+
+def segment_script_by_narration(script, audio_path, segment_duration=12.0, api_key=None, expected_num_segments=None):
+    """
+    Segment a script into segments based on narration audio timing.
+    Uses Whisper API to get word-level timestamps and groups words into 12-second segments.
+    This ensures segments align with actual narration timing rather than word count.
+    
+    Args:
+        script: The complete overarching script
+        audio_path: Path to the narration audio file
+        segment_duration: Duration of each segment in seconds (default: 12.0)
+        api_key: OpenAI API key (if None, uses OPENAI_API_KEY env var or global)
+        expected_num_segments: Expected number of segments (if provided, limits output to this many)
+        
+    Returns:
+        List of segment texts (one per segment), each containing words spoken during that time window
+    """
+    if not OPENAI_AVAILABLE:
+        print("⚠️  OpenAI library not available, falling back to rule-based segmentation")
+        # Fallback: estimate segments based on script length
+        estimated_duration = len(script.split()) * 0.5  # Rough estimate: 0.5s per word
+        num_segments = max(1, int(estimated_duration / segment_duration))
+        return segment_script_rule_based(script, num_segments)
+    
+    if not os.path.exists(audio_path):
+        print(f"⚠️  Audio file not found: {audio_path}, falling back to rule-based segmentation")
+        estimated_duration = len(script.split()) * 0.5
+        num_segments = max(1, int(estimated_duration / segment_duration))
+        return segment_script_rule_based(script, num_segments)
+    
+    # Initialize OpenAI client
+    if api_key is None:
+        api_key = os.getenv('OPENAI_API_KEY')
+    if api_key is None:
+        api_key = OPENAI_API_KEY
+    
+    if not api_key:
+        print("⚠️  No OpenAI API key available, falling back to rule-based segmentation")
+        estimated_duration = len(script.split()) * 0.5
+        num_segments = max(1, int(estimated_duration / segment_duration))
+        return segment_script_rule_based(script, num_segments)
+    
+    client = OpenAI(api_key=api_key)
+    
+    try:
+        print(f"🎤 Transcribing audio with Whisper for {segment_duration}-second segmentation...")
+        
+        # Use Whisper API to get word-level timestamps
+        with open(audio_path, 'rb') as audio_file:
+            transcript = client.audio.transcriptions.create(
+                model="whisper-1",
+                file=audio_file,
+                response_format="verbose_json",
+                timestamp_granularities=["word"]
+            )
+        
+        # Extract word-level timestamps from response
+        words = []
+        
+        if isinstance(transcript, dict):
+            if 'words' in transcript and transcript['words']:
+                words = transcript['words']
+            elif 'segments' in transcript:
+                for segment in transcript['segments']:
+                    if 'words' in segment and segment['words']:
+                        words.extend(segment['words'])
+        else:
+            if hasattr(transcript, 'words') and transcript.words:
+                words = transcript.words
+            elif hasattr(transcript, 'segments') and transcript.segments:
+                for segment in transcript.segments:
+                    if hasattr(segment, 'words') and segment.words:
+                        words.extend(segment.words)
+                    elif isinstance(segment, dict) and 'words' in segment:
+                        words.extend(segment['words'])
+        
+        if not words:
+            print("⚠️  No word-level timestamps available from Whisper, falling back to rule-based segmentation")
+            estimated_duration = len(script.split()) * 0.5
+            num_segments = max(1, int(estimated_duration / segment_duration))
+            return segment_script_rule_based(script, num_segments)
+        
+        print(f"✅ Transcribed {len(words)} words with timestamps")
+        
+        # Find the total duration of the audio
+        total_duration = 0
+        for word_data in words:
+            if isinstance(word_data, dict):
+                end = word_data.get('end', 0)
+            else:
+                end = getattr(word_data, 'end', 0)
+            total_duration = max(total_duration, end)
+        
+        print(f"   Audio duration: {total_duration:.2f}s")
+        
+        # Calculate number of segments needed
+        # If expected_num_segments is provided, use that (narration should match video duration)
+        # Otherwise, calculate based on audio duration
+        if expected_num_segments is not None:
+            num_segments_needed = expected_num_segments
+            print(f"   Using expected number of segments: {num_segments_needed}")
+            # Calculate expected duration based on segments
+            expected_duration = num_segments_needed * segment_duration
+            print(f"   Expected narration duration: {expected_duration:.2f}s (for {num_segments_needed} segments)")
+        else:
+            # Calculate based on actual audio duration
+            num_segments_needed = int((total_duration + segment_duration - 0.1) / segment_duration)  # Round up
+            print(f"   Calculated segments from audio duration: {num_segments_needed}")
+        
+        # Group words into 12-second segments based on timestamps
+        # Use a more efficient approach: iterate through words once and assign them to segments
+        segments = []
+        
+        # Initialize empty segments (only create the expected number)
+        segments = [""] * num_segments_needed
+        
+        # Assign each word to the appropriate segment based on its start time
+        # CRITICAL: Assign ALL words - every word must be assigned to a segment
+        words_assigned = 0
+        for word_data in words:
+            if isinstance(word_data, dict):
+                word = word_data.get('word', '').strip()
+                start = word_data.get('start', 0)
+            else:
+                word = getattr(word_data, 'word', '').strip()
+                start = getattr(word_data, 'start', 0)
+            
+            if not word:
+                continue
+            
+            # Determine which segment this word belongs to (0-indexed)
+            # Simply divide start time by segment duration
+            segment_index = int(start / segment_duration)
+            
+            # Ensure segment_index is within bounds
+            if segment_index < 0:
+                segment_index = 0
+            elif segment_index >= num_segments_needed:
+                # Word is beyond expected segments - assign to last segment
+                segment_index = num_segments_needed - 1
+            
+            # Add word to the appropriate segment
+            if segments[segment_index]:
+                segments[segment_index] += " " + word
+            else:
+                segments[segment_index] = word
+            
+            words_assigned += 1
+        
+        # Remove empty segments at the end (if any), but keep at least expected_num_segments
+        # Only remove if we have more than expected
+        if expected_num_segments is not None:
+            # Keep exactly expected_num_segments
+            segments = segments[:expected_num_segments]
+            # Ensure all segments exist (pad empty ones at end if needed)
+            while len(segments) < expected_num_segments:
+                segments.append("")
+        else:
+            # Remove trailing empty segments
+            while segments and not segments[-1].strip():
+                segments.pop()
+        
+        # Ensure we have at least one segment
+        if not segments:
+            segments = [""]
+        
+        print(f"✅ Segmented script into {len(segments)} {segment_duration}-second segments based on narration timing")
+        print(f"   Total audio duration: {total_duration:.2f}s")
+        print(f"   Words assigned to segments: {words_assigned}/{len(words)}")
+        if expected_num_segments:
+            print(f"   Expected segments: {expected_num_segments}, Created: {len(segments)}")
+        
+        return segments
+        
+    except Exception as e:
+        print(f"⚠️  Whisper transcription failed: {e}")
+        print("   Falling back to rule-based segmentation...")
+        estimated_duration = len(script.split()) * 0.5
+        num_segments = max(1, int(estimated_duration / segment_duration))
+        return segment_script_rule_based(script, num_segments)
 
 
 def convert_segment_to_sora_prompt(
@@ -816,10 +1109,20 @@ NOTE: This is provided ONLY for narrative context to understand where the story 
         ref_type = reference_image_info.get('type', 'subject')
         ref_desc = reference_image_info.get('description', 'the main visual element')
         if ref_type == 'character':
-            context_sections.append(f"""REFERENCE IMAGE CONTEXT:
+            context_sections.append(f"""═══════════════════════════════════════════════════════════════════════════════
+CRITICAL - REFERENCE IMAGE FOR CHARACTER MATCHING:
 A reference image will be provided showing the main character: {ref_desc}
 
-IMPORTANT: The video must feature this same character consistently throughout. The character's appearance, style, and general features should match the reference image. Ensure the character in this segment matches the reference image description.""")
+ABSOLUTELY CRITICAL - EXACT CHARACTER MATCHING REQUIRED:
+- The character in the generated video MUST be THE EXACT SAME PERSON as shown in the reference image
+- This is NOT a look-alike, similar person, or someone with matching features - it MUST be THE EXACT SAME INDIVIDUAL
+- Every facial feature, body type, hair, clothing style, and physical characteristic must match EXACTLY
+- The character's face, build, posture, and appearance must be IDENTICAL to the reference image
+- When describing the character in your Sora prompt, you MUST emphasize that this is the EXACT SAME PERSON from the reference image
+- Use phrases like "the exact same person as shown in the reference image", "identical to the reference character", "the precise individual from the reference image"
+- Do NOT describe the character as "similar to" or "resembling" - it must be THE SAME PERSON
+- This is the SINGLE MOST IMPORTANT requirement for character-based reference images
+═══════════════════════════════════════════════════════════════════════════════""")
         else:
             context_sections.append(f"""REFERENCE IMAGE CONTEXT:
 A reference image will be provided showing: {ref_desc}
@@ -841,14 +1144,29 @@ IMPORTANT: The video must maintain visual consistency with this reference image.
     # Build requirements based on segment type
     # MOST IMPORTANT: Script matching must be the top priority
     visual_requirements = []
+    # Add character matching requirement FIRST if reference image is character-based
+    if reference_image_info and reference_image_info.get('type') == 'character':
+        visual_requirements.append("- ═══════════════════════════════════════════════════════════════════════════════")
+        visual_requirements.append("- SINGLE MOST IMPORTANT REQUIREMENT - EXACT CHARACTER MATCHING:")
+        visual_requirements.append("- The character shown in this video MUST be THE EXACT SAME PERSON as in the reference image")
+        visual_requirements.append("- This is NOT a look-alike or similar person - it MUST be IDENTICAL to the reference image")
+        visual_requirements.append("- Every facial feature, body type, hair, clothing, and physical characteristic must match EXACTLY")
+        visual_requirements.append("- In your prompt, explicitly state that the character is 'the exact same person as shown in the reference image'")
+        visual_requirements.append("- Use phrases like 'identical to the reference character', 'the precise individual from the reference image'")
+        visual_requirements.append("- Do NOT use words like 'similar', 'resembling', 'looks like' - use 'is the same person', 'identical', 'exact match'")
+        visual_requirements.append("- ═══════════════════════════════════════════════════════════════════════════════")
     visual_requirements.append("- MOST CRITICAL: The video MUST make perfect sense with what the script narration is saying during this segment. Every visual element must directly correspond to and support the narration.")
+    visual_requirements.append("- ABSOLUTELY CRITICAL: The video MUST be PHOTOREALISTIC and look like REAL LIFE. It must appear as if filmed by a professional documentary camera with natural lighting, realistic textures, authentic details, and genuine photographic quality. Use terms like 'photorealistic', 'hyperrealistic', 'documentary-style', 'as if filmed by a professional camera', 'real-life footage', 'authentic', 'natural lighting', 'realistic textures' to ensure Sora generates real-world appearance.")
+    visual_requirements.append("- NEVER use artistic, stylized, illustrative, animated, or CGI-like descriptions. Always emphasize that this is real-world footage.")
     visual_requirements.append("- Briefly include camera movement, angle, lighting, mood")
     visual_requirements.append("- Be concise and cinematic")
     # Maximum scenes/cuts per segment (but first and last must be continuous)
     if is_opening_segment or is_closing_segment:
-        visual_requirements.append("- MOSTCRITICAL: This shot must be LONG and can have slow, smooth camera movement, but NO cuts or transitions. Hold the same scene throughout the entire segment. Let the visual breathe before narration begins.")
+        visual_requirements.append("- MOST CRITICAL: This shot must be LONG and can have slow, smooth camera movement, but NO cuts or transitions. Hold the same scene throughout the entire segment. Let the visual breathe before narration begins.")
     else:
         visual_requirements.append("- MOST CRITICAL: The video MUST have at most ONE cut. There should be at the MOST one or two scenes in the video segment.")
+        visual_requirements.append(f"- ABSOLUTELY CRITICAL - NO QUICK CUTS: If there are 2 shots in this {segment_duration:.1f}-second segment, each shot MUST be at least {segment_duration * 0.4:.1f} seconds long (preferably {segment_duration/2:.1f} seconds each). NO shots shorter than {segment_duration * 0.4:.1f} seconds. NO rapid cuts or transitions.")
+        visual_requirements.append("- DURATION REQUIREMENT: Each shot/scene must have adequate duration to be visually coherent. Quick cuts (shots shorter than 3-4 seconds) are ABSOLUTELY FORBIDDEN.")
     
     # Each segment (except the first and last) should start with a new scene/cut
         
@@ -860,17 +1178,128 @@ IMPORTANT: The video must maintain visual consistency with this reference image.
     if not segment_text or len(segment_text.strip()) == 0:
         raise ValueError(f"Segment {segment_id} text is empty! Cannot generate Sora prompt.")
     
+    # Extract key words/phrases from the segment text using AI
+    # This helps identify the main visual focus points for the video
+    key_words_phrases = None
+    num_shots = 1  # Default to 1 shot
+    
+    try:
+        # Use AI to extract key words/phrases and determine number of shots
+        extraction_prompt = f"""Analyze this narration segment and extract the key words or phrases that represent the main visual subjects or concepts:
+        
+"{segment_text}"
+
+Instructions:
+1. Identify 1-3 key words or phrases (nouns, locations, actions, or important concepts) that should be the visual focus
+2. Determine if this segment should be 1 continuous shot or 2 separate shots based on content complexity
+3. CRITICAL: Only suggest 2 shots if there are 2 DISTINCT and EQUALLY IMPORTANT visual subjects/concepts that truly require separate shots. If in doubt, choose 1 shot to avoid quick cuts.
+4. If 2 shots are suggested, each shot must be approximately 6 seconds long (for a 12-second segment) - NO quick cuts allowed
+
+Respond in this exact format:
+KEY_PHRASES: [comma-separated list of 1-3 key phrases]
+NUM_SHOTS: [1 or 2]
+REASONING: [brief explanation]"""
+
+        extraction_response = client.responses.create(
+            model='gpt-4o-mini',  # Use cheaper model for extraction
+            input=[
+                {"role": "system", "content": "Analyze text to extract key visual concepts and determine shot structure."},
+                {"role": "user", "content": extraction_prompt}
+            ],
+            max_output_tokens=200,
+            temperature=0.7
+        )
+        
+        extraction_text = extraction_response.output_text.strip()
+        
+        # Parse the response
+        if "KEY_PHRASES:" in extraction_text:
+            phrases_line = [line for line in extraction_text.split('\n') if 'KEY_PHRASES:' in line]
+            if phrases_line:
+                phrases_text = phrases_line[0].split('KEY_PHRASES:')[1].strip()
+                key_words_phrases = [p.strip() for p in phrases_text.split(',') if p.strip()]
+        
+        if "NUM_SHOTS:" in extraction_text:
+            shots_line = [line for line in extraction_text.split('\n') if 'NUM_SHOTS:' in line]
+            if shots_line:
+                shots_text = shots_line[0].split('NUM_SHOTS:')[1].strip()
+                try:
+                    num_shots = int(shots_text.split()[0])
+                    num_shots = max(1, min(2, num_shots))  # Clamp to 1 or 2
+                except:
+                    num_shots = 1
+        
+        if key_words_phrases:
+            print(f"   📌 Extracted key phrases: {', '.join(key_words_phrases)}")
+            print(f"   🎬 Number of shots: {num_shots}")
+    except Exception as e:
+        print(f"   ⚠️  Key phrase extraction failed: {e}, using default approach")
+        key_words_phrases = None
+        num_shots = 1
+    
+    # Build key phrase instructions for the prompt
+    key_phrase_instructions = ""
+    if key_words_phrases and len(key_words_phrases) > 0:
+        if num_shots == 1:
+            # Single shot - focus on the primary key phrase(s)
+            primary_phrase = key_words_phrases[0] if key_words_phrases else "the main subject"
+            key_phrase_instructions = f"""
+═══════════════════════════════════════════════════════════════════════════════
+CRITICAL VISUAL FOCUS - KEY PHRASE ANALYSIS:
+The narration segment contains these key visual elements: {', '.join(key_words_phrases)}
+
+ABSOLUTELY CRITICAL: This segment should be 1 CONTINUOUS SHOT focused on: {primary_phrase}
+- The entire video must visually center around and emphasize "{primary_phrase}"
+- Every visual element should relate to and support showing "{primary_phrase}"
+- The camera should focus on "{primary_phrase}" throughout the entire shot
+- If multiple key phrases are mentioned, prioritize "{primary_phrase}" as the primary visual focus
+- The shot should be continuous with no cuts - maintain focus on "{primary_phrase}" for the full duration
+═══════════════════════════════════════════════════════════════════════════════"""
+        else:
+            # Two shots - first shot on first phrase, second shot on second phrase
+            first_phrase = key_words_phrases[0] if len(key_words_phrases) > 0 else "the first main subject"
+            second_phrase = key_words_phrases[1] if len(key_words_phrases) > 1 else (key_words_phrases[0] if len(key_words_phrases) > 0 else "the second main subject")
+            # Calculate minimum duration per shot (at least 5 seconds each for a 12-second segment)
+            min_shot_duration = max(5.0, segment_duration * 0.4)  # At least 40% of segment duration, minimum 5 seconds
+            key_phrase_instructions = f"""
+═══════════════════════════════════════════════════════════════════════════════════
+CRITICAL VISUAL FOCUS - KEY PHRASE ANALYSIS:
+The narration segment contains these key visual elements: {', '.join(key_words_phrases)}
+
+ABSOLUTELY CRITICAL: This segment should be 2 SEPARATE SHOTS with EQUAL DURATION:
+- FIRST SHOT: Focus entirely on "{first_phrase}"
+  * The first part of the video must visually center around and emphasize "{first_phrase}"
+  * Every visual element in the first shot should relate to and support showing "{first_phrase}"
+  * The camera should focus on "{first_phrase}" throughout the first shot
+  * DURATION: This first shot MUST last for approximately {segment_duration/2:.1f} seconds (half of the {segment_duration:.1f}-second segment)
+  
+- SECOND SHOT: Focus entirely on "{second_phrase}"
+  * The second part of the video must visually center around and emphasize "{second_phrase}"
+  * Every visual element in the second shot should relate to and support showing "{second_phrase}"
+  * The camera should focus on "{second_phrase}" throughout the second shot
+  * DURATION: This second shot MUST last for approximately {segment_duration/2:.1f} seconds (half of the {segment_duration:.1f}-second segment)
+  
+- CRITICAL DURATION REQUIREMENT: Each shot MUST be approximately {segment_duration/2:.1f} seconds long. NO quick cuts. NO shots shorter than {min_shot_duration:.1f} seconds.
+- There should be ONE clear cut/transition between the two shots at approximately {segment_duration/2:.1f} seconds
+- ABSOLUTELY NO quick cuts or rapid transitions - each shot must have adequate duration to be visually coherent
+- The cut between shots should be smooth and natural, not jarring or abrupt
+═══════════════════════════════════════════════════════════════════════════════════"""
+    
     # Create prompt to convert segment script to Sora video prompt
     # CRITICAL: Put segment_text FIRST and make it the primary focus
     conversion_prompt = f"""Create a Sora-2 video prompt for segment {segment_id} ({start_time:.1f}-{end_time:.1f}s) of a {total_duration}s video.
 
 ═══════════════════════════════════════════════════════════════════════════════
-MOST IMPORTANT: PRIMARY SCRIPT FOR THIS SEGMENT (THE VIDEO MUST MATCH THIS EXACTLY):
-{segment_text}
+CRITICAL: Here is the whole script for this video(just for narrative context):
+{overarching_script}
 
-CRITICAL: This is segment {segment_id} of {total_segments if total_segments else 'unknown'} segments. The script above is the EXACT narration text for seconds {start_time:.1f}-{end_time:.1f} of the video. Your video prompt must match THIS specific portion of the script.
+CRITICAL: Here is the portion of the script for which a video must be generated. You must generate a photorealistic video based on the key idea of this segment of the script:
+{segment_text}
+{key_phrase_instructions}
+
 CRITICAL: The prompt you generate should never tell sora 2 to generate diagrams or words. All of the shots must be a natural scene that could come legitimately from a camera.
-CRITICAL:Do not ever describe the music or sound effects the video should have. Just describe the scene.
+CRITICAL: ABSOLUTELY CRITICAL - The video MUST be PHOTOREALISTIC and look like REAL LIFE. It must appear as if filmed by a professional documentary camera. Use terms like 'photorealistic', 'hyperrealistic', 'documentary-style', 'as if filmed by a professional camera', 'real-life footage', 'authentic', 'natural lighting', 'realistic textures' to ensure Sora generates real-world appearance. NEVER use artistic, stylized, illustrative, animated, or CGI-like descriptions.
+CRITICAL: Do not ever describe the music or sound effects the video should have. Just describe the scene.
 
 Context:
 {context_text}
@@ -883,7 +1312,15 @@ FINAL REMINDER: The video MUST make perfect sense with the script narration abov
 If the script describes a main location, the video MUST show that location.
 If the script mentions an action, the video MUST show that action.
 The video segment MUST be 1 or 2 different scenes or shots.
-Do not ever describe the music or sound effects the video should have. Just describe the scene.
+
+ABSOLUTELY CRITICAL - NO QUICK CUTS:
+- If the video has 1 shot: It must be a continuous {segment_duration:.1f}-second shot with NO cuts
+- If the video has 2 shots: Each shot MUST be approximately {segment_duration/2:.1f} seconds long. NO shots shorter than {segment_duration * 0.4:.1f} seconds. The cut must occur at approximately {segment_duration/2:.1f} seconds into the segment
+- ABSOLUTELY FORBIDDEN: Quick cuts, rapid transitions, or shots shorter than {segment_duration * 0.4:.1f} seconds
+- Each shot must have adequate duration to be visually coherent and meaningful
+
+ABSOLUTELY CRITICAL: The video MUST be PHOTOREALISTIC and look like REAL LIFE - as if filmed by a professional documentary camera with natural lighting, realistic textures, and authentic details. Use terms like 'photorealistic', 'hyperrealistic', 'documentary-style', 'real-life footage' in your prompt.
+{f"═══════════════════════════════════════════════════════════════════════════════\nSINGLE MOST IMPORTANT REQUIREMENT - EXACT CHARACTER MATCHING:\nIf a character reference image is provided, the character in this video MUST be THE EXACT SAME PERSON as shown in the reference image. This is NOT a look-alike - it MUST be IDENTICAL. Every feature must match EXACTLY. In your prompt, explicitly state the character is the exact same person from the reference image. Use phrases like 'identical to the reference character', 'the precise individual from the reference image'. Do NOT use 'similar' or 'resembling' - use 'is the same person', 'identical', 'exact match'.\n═══════════════════════════════════════════════════════════════════════════════\n" if (reference_image_info and reference_image_info.get('type') == 'character') else ""}Do not ever describe the music or sound effects the video should have. Just describe the scene.
 ═══════════════════════════════════════════════════════════════════════════════
 
 Provide ONLY the Sora-2 prompt (no labels):"""
@@ -912,7 +1349,7 @@ Provide ONLY the Sora-2 prompt (no labels):"""
             response = client.responses.create(
                 model=model,
                 input=[
-                    {"role": "system", "content": "Professional Sora 2 Video Prompter. Prompt Sora 2 to create detailed cinematic prompts matching script narration. Always provide complete prompts."},
+                    {"role": "system", "content": f"Professional Sora 2 Video Prompter. Prompt Sora 2 to create detailed cinematic prompts matching script narration. CRITICAL: ALL videos must be ABSOLUTELY PHOTOREALISTIC - they must look like real-life footage captured by a professional documentary camera. Every video must appear as if it were filmed in real life, with natural lighting, realistic textures, authentic details, and genuine photographic quality. Never use artistic, stylized, or illustrative styles. Always emphasize hyperrealism, photorealistic quality, and documentary-style authenticity. {'ABSOLUTELY CRITICAL - CHARACTER REFERENCE IMAGE: When a character-based reference image is provided, the character in the generated video MUST be THE EXACT SAME PERSON as shown in the reference image. This is NOT a look-alike or similar person - it MUST be IDENTICAL. Every facial feature, body type, hair, clothing, and physical characteristic must match EXACTLY. In your prompts, explicitly state that the character is the exact same person from the reference image. Use phrases like identical to the reference character, the precise individual from the reference image. Do NOT use words like similar, resembling, looks like - use is the same person, identical, exact match. This is the SINGLE MOST IMPORTANT requirement when a character reference image is provided.' if (reference_image_info and reference_image_info.get('type') == 'character') else ''} Always provide complete prompts."},
                     {"role": "user", "content": conversion_prompt}
                 ],
                 max_output_tokens=max_tokens,
@@ -970,9 +1407,9 @@ Provide ONLY the Sora-2 prompt (no labels):"""
                 else:
                     # Last attempt failed - use fallback
                     if segment_text and len(segment_text.strip()) > 0:
-                        sora_prompt = f"Cinematic video scene matching the narration: {segment_text[:300]}"
+                        sora_prompt = f"Photorealistic documentary-style video scene matching the narration, as if filmed by a professional camera with natural lighting and realistic textures: {segment_text[:300]}"
                     else:
-                        sora_prompt = f"Cinematic video scene for segment {segment_id} of the video"
+                        sora_prompt = f"Photorealistic documentary-style video scene for segment {segment_id}, as if filmed by a professional camera with natural lighting and realistic textures"
                     print(f"\n❌ FAILED: All {max_retries} attempts returned empty content")
                     print(f"✅ Using fallback prompt based on segment text")
                     return sora_prompt
@@ -1005,18 +1442,18 @@ Provide ONLY the Sora-2 prompt (no labels):"""
             else:
                 # All retries exhausted - use fallback
                 if segment_text and len(segment_text.strip()) > 0:
-                    sora_prompt = f"Cinematic video scene matching the narration: {segment_text[:300]}"
+                    sora_prompt = f"Photorealistic documentary-style video scene matching the narration, as if filmed by a professional camera with natural lighting and realistic textures: {segment_text[:300]}"
                 else:
-                    sora_prompt = f"Cinematic video scene for segment {segment_id} of the video"
+                    sora_prompt = f"Photorealistic documentary-style video scene for segment {segment_id}, as if filmed by a professional camera with natural lighting and realistic textures"
                 print(f"\n❌ FAILED: All {max_retries} attempts failed with errors ({error_type})")
                 print(f"✅ Using fallback prompt based on segment text")
                 return sora_prompt
     
     # Should never reach here, but just in case
     if segment_text and len(segment_text.strip()) > 0:
-        return f"Cinematic video scene matching the narration: {segment_text[:300]}"
+        return f"Photorealistic documentary-style video scene matching the narration, as if filmed by a professional camera with natural lighting and realistic textures: {segment_text[:300]}"
     else:
-        return f"Cinematic video scene for segment {segment_id} of the video"
+        return f"Photorealistic documentary-style video scene for segment {segment_id}, as if filmed by a professional camera with natural lighting and realistic textures"
 
 
 def generate_sora_prompts_from_segments(
@@ -1140,11 +1577,11 @@ def generate_sora_prompts_from_segments(
                 # This should not happen due to retry logic, but if it does, use fallback
                 print(f"  ⚠️  Warning: Prompt validation failed for segment {i}, using fallback...")
                 if segment_text and len(segment_text.strip()) > 0:
-                    sora_prompt = f"Cinematic video scene matching the narration: {segment_text[:300]}"
+                    sora_prompt = f"Photorealistic documentary-style video scene matching the narration, as if filmed by a professional camera with natural lighting and realistic textures: {segment_text[:300]}"
                 elif overarching_script and len(overarching_script.strip()) > 0:
-                    sora_prompt = f"Cinematic video scene: {overarching_script[:300]}"
+                    sora_prompt = f"Photorealistic documentary-style video scene, as if filmed by a professional camera with natural lighting and realistic textures: {overarching_script[:300]}"
                 else:
-                    sora_prompt = f"Cinematic video scene for segment {i} with engaging visuals"
+                    sora_prompt = f"Photorealistic documentary-style video scene for segment {i}, as if filmed by a professional camera with natural lighting and realistic textures"
             
             sora_prompts.append(sora_prompt)
             print(f"  ✅ Segment {i} Sora prompt generated ({len(sora_prompt)} characters)")
@@ -1152,13 +1589,13 @@ def generate_sora_prompts_from_segments(
             print(f"  ⚠️  Failed to convert segment {i} to Sora prompt after retries: {e}")
             # Fallback: use a generic prompt based on the segment text
             if segment_text and len(segment_text.strip()) > 0:
-                fallback_prompt = f"Cinematic video scene matching the narration: {segment_text[:300]}"
+                fallback_prompt = f"Photorealistic documentary-style video scene matching the narration, as if filmed by a professional camera with natural lighting and realistic textures: {segment_text[:300]}"
             else:
                 # If segment text is also empty, use the overarching script or original prompt
                 if overarching_script and len(overarching_script.strip()) > 0:
-                    fallback_prompt = f"Cinematic video scene: {overarching_script[:300]}"
+                    fallback_prompt = f"Photorealistic documentary-style video scene, as if filmed by a professional camera with natural lighting and realistic textures: {overarching_script[:300]}"
                 else:
-                    fallback_prompt = f"Cinematic video scene for segment {i} with engaging visuals"
+                    fallback_prompt = f"Photorealistic documentary-style video scene for segment {i}, as if filmed by a professional camera with natural lighting and realistic textures"
             sora_prompts.append(fallback_prompt)
             print(f"  ⚠️  Using fallback prompt for segment {i}: {fallback_prompt[:100]}...")
     
@@ -1181,17 +1618,284 @@ def generate_sora_prompts_from_segments(
 
 
 
+def generate_voiceover_from_folder(
+    script,
+    output_path=None,
+    narration_folder=None,
+    break_duration=1000,
+    music_volume=0.07):
+    """
+    Generate voiceover audio by stitching together narration files from a folder.
+    Looks for files named narration_0, narration_1, narration_2, etc. in the specified folder,
+    stitches them together in order, adds breaks based on script markers, and mixes with music.
+    
+    Args:
+        script: The script text (used to determine break positions)
+        output_path: Path to save the final audio file (default: temp file)
+        narration_folder: Folder containing narration files (default: 'narration_segments' in current directory)
+        break_duration: Duration of silence for breaks in milliseconds (default: 3000ms = 3 seconds)
+        music_volume: Volume of background music relative to voiceover (0.0-1.0) (default: 0.07, 7%)
+        
+    Returns:
+        Tuple of (path to final audio file with music, path to voiceover-only file without music)
+    """
+    import tempfile
+    
+    try:
+        from pydub import AudioSegment
+    except ImportError as e:
+        error_msg = str(e)
+        if 'pyaudioop' in error_msg or 'audioop' in error_msg:
+            raise ImportError(
+                "pydub requires audioop module which was removed in Python 3.13. "
+                "Install audioop-lts with: pip install audioop-lts"
+            )
+        else:
+            raise ImportError(
+                "pydub library is required for audio stitching. Install with: pip install pydub"
+            )
+    
+    # Determine narration folder
+    if narration_folder is None:
+        narration_folder = os.path.join(os.getcwd(), "narration_segments")
+    
+    # Create folder if it doesn't exist
+    if not os.path.exists(narration_folder):
+        os.makedirs(narration_folder)
+        print(f"📁 Created narration folder: {narration_folder}")
+        print(f"   Please add your narration files as: narration_0.mp3, narration_1.mp3, narration_2.mp3, etc.")
+        raise FileNotFoundError(
+            f"Narration folder is empty: {narration_folder}\n"
+            f"Please add your narration files named: narration_0.mp3, narration_1.mp3, narration_2.mp3, etc."
+        )
+    
+    # Determine output path
+    if output_path is None:
+        temp_dir = tempfile.gettempdir()
+        timestamp = int(time.time())
+        output_path = os.path.join(temp_dir, f"voiceover_stitched_{timestamp}.mp3")
+    
+    temp_dir = tempfile.gettempdir()
+    timestamp = int(time.time())
+    
+    try:
+        # Step 1: Find all narration files in order
+        print(f"📂 Looking for narration files in: {narration_folder}")
+        
+        # Find all narration files (narration_0, narration_1, etc.)
+        narration_files = []
+        i = 0
+        while True:
+            # Try various extensions
+            for ext in ['.mp3', '.wav', '.m4a', '.ogg', '.flac']:
+                file_path = os.path.join(narration_folder, f"narration_{i}{ext}")
+                if os.path.exists(file_path):
+                    narration_files.append({
+                        'path': file_path,
+                        'index': i
+                    })
+                    break
+            else:
+                # No file found for this index
+                if i == 0:
+                    raise FileNotFoundError(
+                        f"No narration files found in {narration_folder}.\n"
+                        f"Expected files: narration_0.mp3, narration_1.mp3, etc."
+                    )
+                # We've reached the end
+                break
+            i += 1
+        
+        if not narration_files:
+            raise FileNotFoundError(
+                f"No narration files found in {narration_folder}.\n"
+                f"Expected files: narration_0.mp3, narration_1.mp3, etc."
+            )
+        
+        print(f"✅ Found {len(narration_files)} narration files")
+        for nf in narration_files:
+            file_size = os.path.getsize(nf['path']) / 1024
+            print(f"   - {os.path.basename(nf['path'])} ({file_size:.1f} KB)")
+        
+        # Step 2: Split script by break markers to determine where breaks should go
+        print("📝 Analyzing script for break markers...")
+        break_positions = []
+        
+        # Find all break markers and their positions
+        for match in re.finditer(r'\[(MUSICAL|VISUAL)\s+BREAK\]', script, re.IGNORECASE):
+            break_positions.append((match.start(), match.end(), match.group(1).upper()))
+        
+        # Determine break positions relative to narration segments
+        # Each narration file corresponds to one segment (before a break or at the end)
+        num_segments = len(narration_files)
+        break_types = []
+        
+        # Map breaks to segments (each break comes after a segment)
+        for i in range(num_segments - 1):  # Last segment has no break after it
+            if i < len(break_positions):
+                break_types.append(break_positions[i][2])  # MUSICAL or VISUAL
+            else:
+                # If we have more segments than breaks, assume MUSICAL BREAK
+                break_types.append('MUSICAL')
+        
+        print(f"✅ Script has {len(break_positions)} break markers")
+        if break_types:
+            print(f"   Break sequence: {' → '.join(break_types)}")
+        
+        # Step 3: Stitch narration files together with breaks
+        print("🔗 Stitching narration files together...")
+        final_audio = AudioSegment.empty()
+        
+        for i, narration_file in enumerate(narration_files):
+            # Load narration audio
+            print(f"   Loading {os.path.basename(narration_file['path'])}...")
+            segment_audio = AudioSegment.from_file(narration_file['path'])
+            final_audio += segment_audio
+            
+            # Add break (silence) after segment if not the last one
+            if i < len(narration_files) - 1:
+                break_type = break_types[i] if i < len(break_types) else 'MUSICAL'
+                silence = AudioSegment.silent(duration=break_duration)
+                final_audio += silence
+                print(f"   Added {break_duration/1000:.1f}s {break_type} break")
+        
+        # Save voiceover-only file (before mixing with music)
+        voiceover_only_path = os.path.join(temp_dir, f"voiceover_only_{timestamp}.mp3")
+        final_audio.export(voiceover_only_path, format='mp3', bitrate='192k')
+        print(f"✅ Stitched narration saved: {voiceover_only_path}")
+        print(f"   Total duration: {len(final_audio) / 1000:.2f}s")
+        
+        # Step 4: Mix with music if available
+        print("🎵 Mixing narration with background music...")
+        music_path = None
+        current_dir = os.getcwd()
+        possible_names = [
+            "VIDEO_MUSIC.mp3",
+            "video_music.mp3",
+            "VIDEO_MUSIC.MP3",
+            os.path.join(current_dir, "VIDEO_MUSIC.mp3"),
+            os.path.join(current_dir, "video_music.mp3"),
+        ]
+        
+        for music_file in possible_names:
+            if os.path.exists(music_file):
+                music_path = music_file
+                file_size = os.path.getsize(music_file)
+                print(f"✅ Found music file: {music_path} ({file_size / 1024:.1f} KB)")
+                break
+        
+        if music_path and os.path.exists(music_path):
+            # Mix voiceover and music
+            ffmpeg_path = find_ffmpeg()
+            if ffmpeg_path:
+                voiceover_duration = len(final_audio) / 1000.0
+                music_duration = get_media_duration(music_path, ffmpeg_path)
+                
+                if music_duration:
+                    # Sync music to voiceover duration
+                    synced_music_path = os.path.join(temp_dir, f"music_synced_{timestamp}.mp3")
+                    
+                    if abs(music_duration - voiceover_duration) > 0.1:
+                        if music_duration > voiceover_duration:
+                            # Trim music
+                            cmd_music = [
+                                ffmpeg_path,
+                                "-i", music_path,
+                                "-t", str(voiceover_duration),
+                                "-af", f"afade=t=out:st={max(0, voiceover_duration-2)}:d=2",
+                                "-c:a", "libmp3lame",
+                                "-b:a", "192k",
+                                "-y",
+                                synced_music_path
+                            ]
+                        else:
+                            # Loop music to extend
+                            loop_count = int((voiceover_duration / music_duration) + 1)
+                            cmd_music = [
+                                ffmpeg_path,
+                                "-stream_loop", str(loop_count - 1),
+                                "-i", music_path,
+                                "-t", str(voiceover_duration),
+                                "-af", f"afade=t=out:st={max(0, voiceover_duration-2)}:d=2",
+                                "-c:a", "libmp3lame",
+                                "-b:a", "192k",
+                                "-y",
+                                synced_music_path
+                            ]
+                        
+                        try:
+                            subprocess.run(cmd_music, capture_output=True, text=True, check=True)
+                            music_path = synced_music_path
+                            print(f"   ✅ Music synced to narration duration ({voiceover_duration:.2f}s)")
+                        except Exception as e:
+                            print(f"   ⚠️  Music sync failed: {e}")
+                            print(f"   Using original music file")
+                    else:
+                        print(f"   ✅ Music duration already matches narration")
+                    
+                    # Mix voiceover and music
+                    filter_complex = (
+                        f"[0:a]aresample=44100,volume=1.0[voice];"
+                        f"[1:a]aresample=44100,volume={music_volume}[music];"
+                        f"[voice][music]amix=inputs=2:duration=first:dropout_transition=2,"
+                        f"volume=2.0"  # Boost volume by 2x after mixing
+                    )
+                    
+                    cmd_mix = [
+                        ffmpeg_path,
+                        "-i", voiceover_only_path,
+                        "-i", music_path,
+                        "-filter_complex", filter_complex,
+                        "-c:a", "libmp3lame",
+                        "-b:a", "192k",
+                        "-ar", "44100",
+                        "-ac", "2",
+                        "-y",
+                        output_path
+                    ]
+                    
+                    try:
+                        subprocess.run(cmd_mix, capture_output=True, text=True, check=True)
+                        print(f"✅ Final narration with music saved: {output_path}")
+                        return output_path, voiceover_only_path
+                    except Exception as e:
+                        print(f"   ⚠️  Music mixing failed: {e}")
+                        print(f"   Using voiceover-only audio")
+                        import shutil
+                        shutil.copy2(voiceover_only_path, output_path)
+                        return output_path, voiceover_only_path
+                else:
+                    print(f"   ⚠️  Could not determine music duration, using voiceover-only")
+                    import shutil
+                    shutil.copy2(voiceover_only_path, output_path)
+                    return output_path, voiceover_only_path
+            else:
+                print(f"   ⚠️  FFmpeg not found, using voiceover-only")
+                import shutil
+                shutil.copy2(voiceover_only_path, output_path)
+                return output_path, voiceover_only_path
+        else:
+            print(f"   ⚠️  VIDEO_MUSIC.mp3 not found, using voiceover-only")
+            import shutil
+            shutil.copy2(voiceover_only_path, output_path)
+            return output_path, voiceover_only_path
+        
+    except Exception as e:
+        raise Exception(f"Failed to generate voiceover from folder: {e}")
+
+
 def generate_voiceover_with_music(
     script,
     output_path=None,
     api_key=None,
     voice='echo',  # Deep, manly male voice
     music_style='cinematic',
-    music_volume=0.10,  # 10% volume for background music
+    music_volume=0.07,  # 7% volume for background music
     duration=None,
     instructions="Use a very passionate and very exciting story telling style."): 
     """
-    Generate voiceover audio from script using OpenAI TTS, add background music with dynamic swells, and combine them.
+    [DEPRECATED] Generate voiceover audio from script using OpenAI TTS, add background music with dynamic swells, and combine them.
+    This function is deprecated. Use generate_voiceover_from_folder instead.
     
     Args:
         script: The script text to convert to voiceover
@@ -1199,7 +1903,7 @@ def generate_voiceover_with_music(
         api_key: OpenAI API key
         voice: TTS voice to use ('alloy', 'echo', 'fable', 'onyx', 'nova', 'shimmer') (default: 'onyx' - deep, manly male voice)
         music_style: Style of background music (default: 'cinematic', will be overridden by script analysis)
-        music_volume: Base volume of background music relative to voiceover (0.0-1.0) (default: 0.10, 10%)
+        music_volume: Base volume of background music relative to voiceover (0.0-1.0) (default: 0.07, 7%)
         duration: Expected duration in seconds (for music generation) (default: None, auto-detect)
         instructions: Instructions for voice characteristics (default: British documentary narration tone)
         
@@ -1474,6 +2178,7 @@ def generate_voiceover_with_music(
                 # Voiceover is typically 24kHz mono, music is 44.1kHz stereo - resample both to 44.1kHz
                 # amix will automatically handle mono+stereo mixing, but ensure both are at same sample rate
                 # Add volume boost after mixing to prevent quiet audio (amix can reduce overall volume)
+                # Mix music and narration together (delay will be applied when adding to video)
                 filter_complex = (
                     f"[0:a]aresample=44100,volume=1.0[voice];"
                     f"[1:a]aresample=44100,volume={music_vol_adjusted}[music];"
@@ -2056,12 +2761,10 @@ def adjust_audio_duration(audio_path, target_duration, output_path=None, ffmpeg_
     duration_ratio = target_duration / current_duration
     
     print(f"   Audio duration: {current_duration:.2f}s, Target: {target_duration:.2f}s, Difference: {duration_diff:+.2f}s")
+    print(f"   Duration ratio: {duration_ratio:.3f}x")
     
-    # If difference is very small (< 0.1s), just pad/trim slightly
-    if abs(duration_diff) < 0.1:
-        print("   Duration difference is minimal, using padding/trimming")
-        method = 'pad'
-    
+    # Only use padding for very small differences AND if method is explicitly 'pad'
+    # If method is 'speed', always use speed adjustment (even for small differences)
     if method == 'speed':
         # Use atempo filter to speed up or slow down
         # atempo range is 0.5 to 2.0 (half speed to double speed)
@@ -2097,17 +2800,20 @@ def adjust_audio_duration(audio_path, target_duration, output_path=None, ffmpeg_
         else:
             print(f"   Adjusting speed by {duration_ratio:.2f}x (minimal pitch change)")
         
+        # Don't use -t flag with atempo - let atempo handle the duration
+        # The atempo filter will naturally change the duration
         cmd = [
             ffmpeg_path,
             "-i", audio_path,
             "-af", filter_chain,
-            "-t", str(target_duration),  # Ensure exact duration
             "-c:a", "libmp3lame",  # Preserve codec
             "-b:a", "192k",  # Preserve bitrate
             "-ac", "2",  # Preserve stereo
             "-y",
             output_path
         ]
+        
+        print(f"   Running FFmpeg command: {' '.join(cmd)}")
     else:
         # Method: pad or trim
         if duration_diff > 0:
@@ -2142,17 +2848,25 @@ def adjust_audio_duration(audio_path, target_duration, output_path=None, ffmpeg_
             ]
     
     try:
-        subprocess.run(cmd, capture_output=True, text=True, check=True)
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
         
         # Verify the output duration
         adjusted_duration = get_media_duration(output_path, ffmpeg_path)
         if adjusted_duration:
             print(f"   ✅ Adjusted audio duration: {adjusted_duration:.2f}s (target: {target_duration:.2f}s)")
+            # Check if adjustment was successful
+            if method == 'speed' and abs(adjusted_duration - target_duration) > 0.5:
+                print(f"   ⚠️  Warning: Speed adjustment may not have worked correctly. Duration is off by {abs(adjusted_duration - target_duration):.2f}s")
         
         return output_path
     except subprocess.CalledProcessError as e:
-        print(f"⚠️  Audio adjustment failed: {e.stderr}")
-        # Fallback: just trim or pad
+        print(f"⚠️  Audio adjustment failed!")
+        print(f"   Error: {e.stderr}")
+        print(f"   Command: {' '.join(cmd)}")
+        # Don't fall back to trim if speed adjustment was requested - raise error instead
+        if method == 'speed':
+            raise Exception(f"Speed adjustment failed: {e.stderr}")
+        # Only fall back for pad/trim methods
         try:
             cmd = [
                 ffmpeg_path,
@@ -2423,19 +3137,20 @@ def add_audio_to_video(video_path, audio_path, output_path=None, ffmpeg_path=Non
         else:
             print("⚠️  Could not determine durations, skipping synchronization")
     
-    # Step 2: Add audio to video with volume boost
+    # Step 2: Add audio to video with volume boost and 1-second delay
     # Use ffmpeg to add audio to video
     # Remove any existing audio and replace with new audio track
     # Apply volume boost to ensure audio is loud enough (compensate for any volume loss during encoding)
+    # Add 1-second delay so audio starts 1 second after video starts
     if remove_existing_audio:
         # Map only video from first input, audio from second input (removes existing audio)
-        # Apply volume boost to ensure audio is at proper level
+        # Apply volume boost and 1-second delay to ensure audio starts 1 second after video
         cmd = [
             ffmpeg_path,
             "-i", video_path,
             "-i", adjusted_audio_path,
             "-c:v", "copy",      # Copy video stream without re-encoding
-            "-af", "volume=1.5",  # Boost audio by 1.5x (3.5dB) to ensure it's loud enough
+            "-af", "volume=1.5,adelay=1000|1000",  # Boost audio by 1.5x and delay by 1 second (1000ms)
             "-c:a", "aac",       # Encode audio as AAC
             "-b:a", "192k",      # High quality audio bitrate
             "-map", "0:v:0",     # Use video from first input (video only, no audio)
@@ -2446,11 +3161,13 @@ def add_audio_to_video(video_path, audio_path, output_path=None, ffmpeg_path=Non
         ]
     else:
         # Keep existing audio and mix (not recommended for our use case)
+        # Apply 1-second delay so audio starts 1 second after video
         cmd = [
             ffmpeg_path,
             "-i", video_path,
             "-i", adjusted_audio_path,
             "-c:v", "copy",
+            "-af", "adelay=1000|1000",  # Delay audio by 1 second (1000ms)
             "-c:a", "aac",
             "-map", "0:v:0",
             "-map", "1:a:0",
@@ -2945,10 +3662,20 @@ The still image should lead naturally into what comes next in the narrative.""")
         ref_type = reference_image_info.get('type', 'subject')
         ref_desc = reference_image_info.get('description', 'the main visual element')
         if ref_type == 'character':
-            context_sections.append(f"""REFERENCE IMAGE CONTEXT:
+            context_sections.append(f"""═══════════════════════════════════════════════════════════════════════════════
+CRITICAL - REFERENCE IMAGE FOR CHARACTER MATCHING:
 A reference image will be provided showing the main character: {ref_desc}
 
-IMPORTANT: The still image must feature this same character consistently. The character's appearance, style, and general features should match the reference image.""")
+ABSOLUTELY CRITICAL - EXACT CHARACTER MATCHING REQUIRED:
+- The character in the generated still image MUST be THE EXACT SAME PERSON as shown in the reference image
+- This is NOT a look-alike, similar person, or someone with matching features - it MUST be THE EXACT SAME INDIVIDUAL
+- Every facial feature, body type, hair, clothing style, and physical characteristic must match EXACTLY
+- The character's face, build, posture, and appearance must be IDENTICAL to the reference image
+- When describing the character in your DALL-E prompt, you MUST emphasize that this is the EXACT SAME PERSON from the reference image
+- Use phrases like "the exact same person as shown in the reference image", "identical to the reference character", "the precise individual from the reference image"
+- Do NOT describe the character as "similar to" or "resembling" - it must be THE SAME PERSON
+- This is the SINGLE MOST IMPORTANT requirement for character-based reference images
+═══════════════════════════════════════════════════════════════════════════════""")
         else:
             context_sections.append(f"""REFERENCE IMAGE CONTEXT:
 A reference image will be provided showing: {ref_desc}
@@ -2959,6 +3686,17 @@ IMPORTANT: The still image must maintain visual consistency with this reference 
     
     # Build requirements (similar to Sora prompt requirements)
     visual_requirements = []
+    # Add character matching requirement FIRST if reference image is character-based
+    if reference_image_info and reference_image_info.get('type') == 'character':
+        visual_requirements.append("- ═══════════════════════════════════════════════════════════════════════════════")
+        visual_requirements.append("- SINGLE MOST IMPORTANT REQUIREMENT - EXACT CHARACTER MATCHING:")
+        visual_requirements.append("- The character shown in this still image MUST be THE EXACT SAME PERSON as in the reference image")
+        visual_requirements.append("- This is NOT a look-alike or similar person - it MUST be IDENTICAL to the reference image")
+        visual_requirements.append("- Every facial feature, body type, hair, clothing, and physical characteristic must match EXACTLY")
+        visual_requirements.append("- In your prompt, explicitly state that the character is 'the exact same person as shown in the reference image'")
+        visual_requirements.append("- Use phrases like 'identical to the reference character', 'the precise individual from the reference image'")
+        visual_requirements.append("- Do NOT use words like 'similar', 'resembling', 'looks like' - use 'is the same person', 'identical', 'exact match'")
+        visual_requirements.append("- ═══════════════════════════════════════════════════════════════════════════════")
     visual_requirements.append("- Visuals directly relate to the PRIMARY SCRIPT SEGMENT above")
     visual_requirements.append("- Maintain continuity with previous segments (unless script indicates change)")
     visual_requirements.append("- Be visually striking and suitable for an 8-second contemplative moment with camera panning")
@@ -2980,14 +3718,14 @@ Requirements:
 {requirements_text}
 
 CRITICAL: The still image prompt you create must directly relate to the narration in the PRIMARY SCRIPT SEGMENT above. The still image should visually represent or complement the story moment described in that segment. Match the style and tone of the Sora video prompts used for the video segments.
-
+{f"═══════════════════════════════════════════════════════════════════════════════\nSINGLE MOST IMPORTANT REQUIREMENT - EXACT CHARACTER MATCHING:\nIf a character reference image is provided, the character in this still image MUST be THE EXACT SAME PERSON as shown in the reference image. This is NOT a look-alike - it MUST be IDENTICAL. Every feature must match EXACTLY. In your prompt, explicitly state the character is the exact same person from the reference image. Use phrases like 'identical to the reference character', 'the precise individual from the reference image'. Do NOT use 'similar' or 'resembling' - use 'is the same person', 'identical', 'exact match'.\n═══════════════════════════════════════════════════════════════════════════════\n" if (reference_image_info and reference_image_info.get('type') == 'character') else ""}
 Provide ONLY the DALL-E prompt (no labels, no explanation, just the prompt text):"""
     
     try:
         response = client.responses.create(
             model=model,
             input=[
-                {"role": "system", "content": "Professional video director and image prompt specialist. Create detailed cinematic DALL-E prompts for still images that match script narration and maintain visual consistency with video segments. CRITICAL: The still image must relate directly to the PRIMARY SCRIPT SEGMENT provided. Ensure visual continuity and narrative flow. Always provide complete, detailed prompts. CRITICAL: All images must be hyperrealistic and photorealistic, as if photographed by a professional documentary photographer - make them look like real photographs with natural lighting, realistic textures, and maximum detail. Never create prompts with likenesses of real people, celebrities, or historical figures. Always use generic, artistic, stylized representations, but make them appear completely realistic and photographic."},
+                {"role": "system", "content": f"Professional video director and image prompt specialist. Create detailed cinematic DALL-E prompts for still images that match script narration and maintain visual consistency with video segments. CRITICAL: The still image must relate directly to the PRIMARY SCRIPT SEGMENT provided. Ensure visual continuity and narrative flow. Always provide complete, detailed prompts. CRITICAL: All images must be hyperrealistic and photorealistic, as if photographed by a professional documentary photographer - make them look like real photographs with natural lighting, realistic textures, and maximum detail. Never create prompts with likenesses of real people, celebrities, or historical figures. Always use generic, artistic, stylized representations, but make them appear completely realistic and photographic. {'ABSOLUTELY CRITICAL - CHARACTER REFERENCE IMAGE: When a character-based reference image is provided, the character in the generated still image MUST be THE EXACT SAME PERSON as shown in the reference image. This is NOT a look-alike or similar person - it MUST be IDENTICAL. Every facial feature, body type, hair, clothing, and physical characteristic must match EXACTLY. In your prompts, explicitly state that the character is the exact same person from the reference image. Use phrases like identical to the reference character, the precise individual from the reference image. Do NOT use words like similar, resembling, looks like - use is the same person, identical, exact match. This is the SINGLE MOST IMPORTANT requirement when a character reference image is provided.' if (reference_image_info and reference_image_info.get('type') == 'character') else ''}"},
                 {"role": "user", "content": conversion_prompt}
             ],
             max_output_tokens=20000,
@@ -3026,181 +3764,36 @@ Provide ONLY the DALL-E prompt (no labels, no explanation, just the prompt text)
             return "A hyperrealistic, photorealistic, high-quality still image, as if photographed by a professional documentary photographer, suitable for a documentary-style video. Make it look like a real photograph with natural lighting, realistic textures, and maximum detail."
 
 
-def calculate_still_image_positions(num_videos, segment_duration, total_duration, script, segment_texts, api_key=None, model='gpt-5-2025-08-07', test=False, reference_image_info=None):
+def analyze_script_for_still_images(script, segment_texts, target_num_stills, api_key=None, model='gpt-4o', reference_images=None):
     """
-    Calculate positions for still images: after every 3 videos, a 12-second still image.
-    If test=True, also adds an opening still image at the beginning.
-    
-    Pattern (normal): V1, V2, V3, Still(12s), V4, V5, V6, Still(12s), V7, V8, V9, Still(12s), ...
-    Pattern (test): Still(12s), V1, V2, V3, Still(12s), V4, V5, V6, Still(12s), ...
-    
-    Args:
-        num_videos: Total number of video segments
-        segment_duration: Duration of each video segment in seconds
-        total_duration: Total video duration in seconds
-        script: The full overarching script (for generating image prompts)
-        segment_texts: List of segment script texts
-        api_key: OpenAI API key
-        model: Model to use (default: 'gpt-4o')
-        test: If True, add an opening still image at the beginning
-        
-    Returns:
-        List of dictionaries with 'segment_id' (0 for opening, or position after which video), 'image_prompt', 'duration' (12.0), 'reasoning'
-    """
-    STILL_IMAGE_DURATION = 12.0
-    VIDEOS_PER_STILL = 3
-    
-    still_image_segments = []
-    
-    # If test mode, ALWAYS add opening still image (segment_id = 0 means at the beginning)
-    # This happens regardless of number of videos or script content
-    if test:
-        try:
-            # Get first segment text for opening still image context
-            opening_context = segment_texts[0] if segment_texts and len(segment_texts) > 0 else (script[:500] if script else "")
-            next_segment_text = segment_texts[1] if segment_texts and len(segment_texts) > 1 else None
-            
-            # Generate opening still image prompt based on the overall script
-            opening_prompt = generate_still_image_prompt(
-                script=script or "",  # Ensure script is not None
-                context_segment=opening_context,  # Use first segment or beginning of script for opening
-                position=0,  # Position 0 = opening
-                num_videos=num_videos,
-                api_key=api_key,
-                model=model,
-                previous_segment_text=None,  # No previous segment for opening
-                next_segment_text=next_segment_text,  # Next segment for forward continuity
-                reference_image_info=reference_image_info  # Reference image for consistency
-            )
-        except Exception as e:
-            print(f"⚠️  Failed to generate opening still image prompt: {e}")
-            # Fallback prompt for opening still image
-            opening_prompt = f"A hyperrealistic, photorealistic, high-quality opening still image, as if photographed by a professional documentary photographer, representing the video topic: {script[:200] if script else 'documentary introduction'}. Make it look like a real photograph with natural lighting, realistic textures, and maximum detail."
-        
-        still_image_segments.append({
-            'segment_id': 0,  # 0 = opening still image
-            'image_prompt': opening_prompt,
-            'duration': STILL_IMAGE_DURATION,
-            'reasoning': "Opening still image (test mode)"
-        })
-    
-    # Calculate still image positions: after videos 3, 6, 9, 12, ...
-    still_image_positions = []
-    for i in range(VIDEOS_PER_STILL, num_videos, VIDEOS_PER_STILL):
-        still_image_positions.append(i)
-    
-    # Generate image prompts for each still image position
-    for position in still_image_positions:
-        # Get context from the script around this position
-        # Use the segment text from the video before the still image
-        if position > 0 and position <= len(segment_texts):
-            context_segment = segment_texts[position - 1]  # Video segment before still image
-            previous_segment_text = segment_texts[position - 2] if position > 1 and position - 2 < len(segment_texts) else None
-            next_segment_text = segment_texts[position] if position < len(segment_texts) else None
-        else:
-            context_segment = segment_texts[0] if segment_texts else ""
-            previous_segment_text = None
-            next_segment_text = segment_texts[1] if segment_texts and len(segment_texts) > 1 else None
-        
-        # Generate image prompt based on context (matching Sora prompt style)
-        image_prompt = generate_still_image_prompt(
-            script=script,
-            context_segment=context_segment,
-            position=position,
-            num_videos=num_videos,
-            api_key=api_key,
-            model=model,
-            previous_segment_text=previous_segment_text,  # Previous segment for continuity
-            next_segment_text=next_segment_text,  # Next segment for forward continuity
-            reference_image_info=reference_image_info  # Reference image for consistency
-        )
-        
-        still_image_segments.append({
-            'segment_id': position,  # Position after which video (e.g., 3 = after video 3)
-            'image_prompt': image_prompt,
-            'duration': STILL_IMAGE_DURATION,
-            'reasoning': f"Still image after video {position} (following pattern: after every {VIDEOS_PER_STILL} videos)"
-        })
-    
-    # In test mode, we should always have at least the opening still image
-    # Verify this is the case
-    if test and not any(seg['segment_id'] == 0 for seg in still_image_segments):
-        print("⚠️  Warning: Test mode enabled but opening still image was not added!")
-        # Force add opening still image as fallback
-        still_image_segments.insert(0, {
-            'segment_id': 0,
-            'image_prompt': f"A hyperrealistic, photorealistic, high-quality opening still image, as if photographed by a professional documentary photographer, representing the video topic. Make it look like a real photograph with natural lighting, realistic textures, and maximum detail.",
-            'duration': STILL_IMAGE_DURATION,
-            'reasoning': "Opening still image (test mode - fallback)"
-        })
-    
-    return still_image_segments
-
-
-def analyze_script_for_still_images(script, segment_texts, segment_duration, total_duration, target_num_stills=None, api_key=None, model='gpt-4o', test=False, reference_image_info=None):
-    """
-    Analyze script to identify where still images should be placed.
-    Uses AI to avoid action scenes and find appropriate contemplative moments.
+    Analyze script to identify which segments should be still images AND determine reference image usage for video segments.
+    Multi-purpose function that:
+    1. Identifies which segments should be still images (existing functionality)
+    2. For each segment, determines: still image or video? If video, which reference image to use?
     
     Still images work well for: key moments, important visuals, transitions, dramatic pauses, etc.
     AVOIDS: action scenes, fights, battles, chases, fast-paced moments.
     
-    Total still image duration should be approximately 1/3 (33%) of total video duration.
-    Each still image should be 12.0 seconds long.
-    
     Args:
         script: The full overarching script
-        segment_texts: List of segment script texts
-        segment_duration: Duration of each segment in seconds
-        total_duration: Total video duration in seconds
+        segment_texts: List of segment script texts (all segments, both video and still)
+        target_num_stills: Target number of still images (approximately 1/3 of total segments)
         api_key: OpenAI API key
         model: Model to use (default: 'gpt-4o')
-        test: If True, add an opening still image at the beginning
-        reference_image_info: Dict with reference image info for consistency
+        reference_images: List of reference image dictionaries with 'id', 'type', 'description' (from analyze_script_for_reference_images)
         
     Returns:
-        List of dictionaries with 'segment_id' (0 for opening, or position after which video), 'segment_text', 'image_prompt', 'duration', 'reasoning'
+        Dictionary with:
+        - 'still_image_segments': List of dictionaries with 'segment_id', 'segment_text', 'image_prompt', 'duration', 'reasoning'
+        - 'segment_assignments': List of dictionaries, one per segment, with 'segment_id', 'type' ('still' or 'video'), 'reference_image_id' (or None)
     """
     # Standard still image duration (12 seconds per still image)
     STILL_IMAGE_DURATION = 12.0
-    
-    # Calculate target total still image duration (approximately 1/3 of video duration, max 1/3)
-    # But we'll use 12 seconds per still image, so adjust number of stills accordingly
-    target_total_still_duration = total_duration / 3.0  # Target 1/3 (33%) of total duration
-    
-    # Min and max duration per still image (for good viewing experience)
-    # Note: We standardize to 12.0 seconds, but the analysis uses these for calculation
-    MIN_STILL_DURATION = 12.0  # Standardized to 12 seconds
-    MAX_STILL_DURATION = 12.0  # Standardized to 12 seconds
-    
-    # Calculate reasonable number of still images based on target duration (1/3 of total)
-    # Target: 1/3 of total duration should be still images
-    # Each still image is 12 seconds, so: ideal_num_stills = (total_duration / 3) / 12
+    segment_duration = 12.0  # Each segment is 12 seconds
     num_segments = len(segment_texts)
     
-    # Calculate ideal number based on 1/3 target
-    ideal_num_stills_by_duration = int(target_total_still_duration / STILL_IMAGE_DURATION)
-    
-    # Cap at 1/3 of segments to ensure we have more videos than still images
-    # Never use more than 1/3 of segments for still images
-    max_stills_by_segments = max(1, int(num_segments / 3))  # At most 1/3 of segments
-    
-    # Use the smaller of: (1) calculated from 1/3 duration target, (2) 1/3 of segments
-    ideal_num_stills = min(ideal_num_stills_by_duration, max_stills_by_segments)
-    
-    # Ensure at least 1 still image for longer videos, but respect the 1/3 cap
-    if total_duration >= 24:  # At least 24 seconds to warrant a still image
-        ideal_num_stills = max(1, ideal_num_stills)
-    
-    # Final safety check: ensure we have more segments than still images
-    ideal_num_stills = min(ideal_num_stills, max(1, num_segments - 1))
-    
-    # Ensure we don't exceed 1/3 of total duration
-    max_still_duration_allowed = total_duration / 3.0
-    max_stills_by_duration = int(max_still_duration_allowed / STILL_IMAGE_DURATION)
-    ideal_num_stills = min(ideal_num_stills, max_stills_by_duration)
-    
-    # Use standard 12.0 seconds per still image
+    # Use target_num_stills directly (already calculated as approximately 1/3)
+    ideal_num_stills = target_num_stills
     ideal_duration_per_still = STILL_IMAGE_DURATION
     if not OPENAI_AVAILABLE:
         raise ImportError("openai library is required. Install with: pip install openai")
@@ -3213,7 +3806,7 @@ def analyze_script_for_still_images(script, segment_texts, segment_duration, tot
     
     client = OpenAI(api_key=api_key)
     
-    # Create segments info for analysis
+    # Create segments info for analysis (include full text for better context)
     segments_info = []
     for i, seg_text in enumerate(segment_texts, 1):
         start_time = (i - 1) * segment_duration
@@ -3222,10 +3815,64 @@ def analyze_script_for_still_images(script, segment_texts, segment_duration, tot
             'segment_id': i,
             'start_time': start_time,
             'end_time': end_time,
-            'text': seg_text[:300]  # Truncate for analysis
+            'text': seg_text  # Use full text for better analysis
         })
     
-    analysis_prompt = f"""Analyze this script and identify {ideal_num_stills} segments (out of {len(segment_texts)} total) where a high-quality still image with camera panning would be most effective.
+    # Build reference images context for the prompt
+    reference_images_context = ""
+    if reference_images and len(reference_images) > 0:
+        ref_list = []
+        for ref_img in reference_images:
+            ref_id = ref_img.get('id', 'unknown')
+            ref_desc = ref_img.get('description', '')
+            ref_type = ref_img.get('type', 'subject')
+            ref_list.append(f"- {ref_id}: {ref_desc} (type: {ref_type})")
+        reference_images_context = f"""
+═══════════════════════════════════════════════════════════════════════════════
+CRITICAL - AVAILABLE REFERENCE IMAGES (MUST be used for video segments when applicable):
+═══════════════════════════════════════════════════════════════════════════════
+{chr(10).join(ref_list)}
+
+REFERENCE IMAGE ASSIGNMENT RULES:
+1. For EACH video segment, analyze if it features any of the reference images above
+2. If a segment mentions, describes, or shows the subject/character from a reference image, you MUST assign that reference image's ID
+3. Character-type reference images: Use when the segment features that character (even briefly or in description)
+4. Subject-type reference images: Use when the segment features that location, object, or visual element
+5. You should assign reference images to MOST video segments that relate to them - be generous, not conservative
+6. Only use null if the segment truly has NO connection to any reference image
+7. If multiple reference images could apply, choose the PRIMARY one that best matches the segment's focus
+
+EXAMPLES:
+- Segment mentions "Blackbeard" and ref_1 is "Blackbeard's face" → assign "ref_1"
+- Segment describes "the ship" and ref_2 is "Blackbeard's ship" → assign "ref_2"
+- Segment is about a battle location and ref_3 is "battlefield location" → assign "ref_3"
+- Segment is about something completely unrelated → use null
+
+CRITICAL: Reference images exist to maintain visual consistency. When in doubt, assign the reference image if there's ANY connection.
+═══════════════════════════════════════════════════════════════════════════════
+"""
+    else:
+        reference_images_context = """
+NOTE: No reference images were identified for this video. All video segments will use null for reference_image_id.
+"""
+    
+    analysis_prompt = f"""Analyze this script and perform TWO tasks:
+
+TASK 1: Identify {ideal_num_stills} segments (out of {len(segment_texts)} total) where a high-quality still image with camera panning would be most effective.
+
+TASK 2: For EACH of the {len(segment_texts)} segments, determine:
+- Is it a still image or video?
+- If video, which reference image should be used (from the available reference images below), or null if none?
+
+{reference_images_context}
+
+FULL SCRIPT (for complete context):
+{script}
+
+SEGMENTS (each is 12 seconds):
+{chr(10).join([f"Segment {s['segment_id']} ({s['start_time']:.1f}s-{s['end_time']:.1f}s):\n{s['text']}\n" for s in segments_info])}
+
+CRITICAL: AVOID placing still images during action scenes or fast-paced moments:
 
 CRITICAL: AVOID placing still images during action scenes or fast-paced moments:
 - NO still images during: fights, battles, chases, explosions, combat, violence, fast action
@@ -3244,39 +3891,56 @@ PREFER placing still images during:
 - Character moments: quiet character scenes (NOT action scenes)
 - Establishing shots: when introducing a new location or setting
 
-IMPORTANT: Total still image duration should be approximately {target_total_still_duration:.1f} seconds (about 1/3 of the {total_duration:.1f}s video). This should NOT exceed 1/3 of the total video duration.
-Each still image should be between {MIN_STILL_DURATION:.1f} and {MAX_STILL_DURATION:.1f} seconds long.
-Target duration per still image: approximately {ideal_duration_per_still:.1f} seconds.
+IMPORTANT: You have {len(segment_texts)} total segments. Select exactly {ideal_num_stills} segments for still images (approximately 1/3). The remaining {num_segments - ideal_num_stills} segments will be videos (approximately 2/3).
+Each still image is 12 seconds long.
+
+CRITICAL: Segment 1 (the opening segment) MUST ALWAYS be a video, NEVER a still image. The opening must be dynamic and engaging.
 
 Full script: {script[:1000]}{'...' if len(script) > 1000 else ''}
 
 Segments:
 {chr(10).join([f"Segment {s['segment_id']} ({s['start_time']:.1f}s-{s['end_time']:.1f}s): {s['text']}" for s in segments_info])}
 
-Output JSON array:
-[
-    {{
-        "segment_id": 1,
-        "image_prompt": "Detailed DALL-E prompt for a hyperrealistic, photorealistic, high-quality still image matching this segment's narration, as if photographed by a professional documentary photographer. Make it look like a real photograph with natural lighting, realistic textures, and maximum detail. MUST comply with OpenAI content policy: no violence, hate, adult content, illegal activity, copyrighted characters, or likenesses of real people. Use generic, artistic representations only, but make them appear completely realistic and photographic.",
-        "duration": {ideal_duration_per_still:.1f},
-        "reasoning": "Why this segment benefits from a still image (and why it's NOT an action scene)"
-    }}
-]
+Output JSON object with TWO arrays:
+{{
+    "still_image_segments": [
+        {{
+            "segment_id": 1,
+            "image_prompt": "Detailed DALL-E prompt for a hyperrealistic, photorealistic, high-quality still image matching this segment's narration, as if photographed by a professional documentary photographer. Make it look like a real photograph with natural lighting, realistic textures, and maximum detail. MUST comply with OpenAI content policy: no violence, hate, adult content, illegal activity, copyrighted characters, or likenesses of real people. Use generic, artistic representations only, but make them appear completely realistic and photographic.",
+            "duration": 12.0,
+            "reasoning": "Why this segment benefits from a still image (and why it's NOT an action scene)"
+        }}
+    ],
+    "segment_assignments": [
+        {{
+            "segment_id": 1,
+            "type": "still" or "video",
+            "reference_image_id": "ref_1" or null
+        }}
+    ]
+}}
 
 Rules:
-- Select exactly {ideal_num_stills} segments (to achieve approximately {target_total_still_duration:.1f}s total still image duration)
+- still_image_segments: Select exactly {ideal_num_stills} segments (approximately 1/3 of {len(segment_texts)} total segments) for still images
+- segment_assignments: Provide an entry for EVERY segment (1 through {len(segment_texts)})
+- For each segment in segment_assignments:
+  * type: "still" if it's a still image, "video" if it's a video
+  * reference_image_id: The ID of the reference image to use (from available reference images above), or null if no reference image is needed
+- ABSOLUTELY CRITICAL: Segment 1 (the opening segment) MUST be a video, NEVER a still image. Do NOT select segment 1 for still images.
 - CRITICAL: Ensure there are MORE video segments than still images (you have {len(segment_texts)} segments total, select only {ideal_num_stills} for still images)
-- Each still image should be between {MIN_STILL_DURATION:.1f} and {MAX_STILL_DURATION:.1f} seconds long
-- Aim for approximately {ideal_duration_per_still:.1f} seconds per still image
-- Total duration of all still images should sum to approximately {target_total_still_duration:.1f} seconds (1/3 of total duration, but NOT more than 1/3)
-- CRITICAL: Skip any segments that contain action, fights, battles, or fast-paced scenes
+- Each still image is 12.0 seconds long
+- CRITICAL: Skip any segments that contain action, fights, battles, or fast-paced scenes for still images
+- For video segments, you MUST assign a reference image if the segment features, mentions, or describes the subject/character from any reference image
+- Be GENEROUS with reference image assignments - if there's any connection between the segment and a reference image, assign it
+- Only use null if the segment truly has NO connection to any reference image (e.g., generic narration, unrelated topic)
+- CRITICAL: Most video segments should have a reference image assigned if reference images exist - they were created for visual consistency
+- If a segment could match multiple reference images, choose the PRIMARY one that best matches the segment's main focus
 - image_prompt MUST be safe, appropriate, and comply with OpenAI DALL-E content policies
 - CRITICAL: NEVER include likenesses of real people, celebrities, or historical figures
 - Avoid: violence, hate speech, adult content, illegal activities, real people, copyrighted characters
 - Use: generic, artistic, educational, and appropriate visual descriptions
-- The image should directly relate to the segment's narration and story
 
-Provide ONLY valid JSON array:"""
+Provide ONLY valid JSON object:"""
     
     try:
         response = client.responses.create(
@@ -3290,88 +3954,111 @@ Provide ONLY valid JSON array:"""
         )
         
         import json
-        still_image_segments = json.loads(response.output_text)
+        analysis_result = json.loads(response.output_text)
         
-        # Validate and enrich with full segment text
-        validated_segments = []
-        for seg_info in still_image_segments:
+        # Extract still image segments
+        still_image_segments_raw = analysis_result.get('still_image_segments', [])
+        segment_assignments_raw = analysis_result.get('segment_assignments', [])
+        
+        # Validate and enrich still image segments with full segment text
+        # CRITICAL: Segment 1 MUST be a video, never a still image
+        validated_still_segments = []
+        for seg_info in still_image_segments_raw:
             segment_id = seg_info.get('segment_id')
             if 1 <= segment_id <= len(segment_texts):
-                # Clamp duration to min/max bounds
-                raw_duration = float(seg_info.get('duration', ideal_duration_per_still))
-                clamped_duration = min(max(MIN_STILL_DURATION, raw_duration), MAX_STILL_DURATION)
+                # CRITICAL: Skip segment 1 - it must always be a video
+                if segment_id == 1:
+                    print(f"⚠️  Warning: Segment 1 was assigned as still image, but it MUST be a video. Removing from still images.")
+                    continue
                 
                 # Get context for better image prompt generation
-                context_segment = segment_texts[segment_id - 1]
-                previous_segment_text = segment_texts[segment_id - 2] if segment_id > 1 and segment_id - 2 < len(segment_texts) else None
-                next_segment_text = segment_texts[segment_id] if segment_id < len(segment_texts) else None
+                # CRITICAL: segment_texts contains NARRATION-BASED segments (words actually spoken)
+                # This ensures still images are generated based on what's being narrated, not the original script
+                context_segment = segment_texts[segment_id - 1]  # NARRATION-BASED segment text
                 
                 # Use the AI-provided image prompt (it's already detailed and context-aware)
+                # The AI generated this prompt based on the narration segment text above
                 detailed_image_prompt = seg_info.get('image_prompt', '')
                 
-                validated_segments.append({
+                validated_still_segments.append({
                     'segment_id': segment_id,
-                    'segment_text': context_segment,
-                    'image_prompt': detailed_image_prompt,
+                    'segment_text': context_segment,  # NARRATION-BASED segment (from actual audio)
+                    'image_prompt': detailed_image_prompt,  # Generated from narration segment
                     'duration': STILL_IMAGE_DURATION,  # Always 12.0 seconds
                     'reasoning': seg_info.get('reasoning', '')
                 })
         
-        # All still images are standardized to 12.0 seconds
-        # No need to adjust durations since they're all the same
-        
-        # If test mode, add opening still image if not already present
-        if test:
-            if not any(seg.get('segment_id') == 0 for seg in validated_segments):
-                # Generate opening still image prompt
-                try:
-                    opening_prompt = generate_still_image_prompt(
-                        script=script,
-                        context_segment=segment_texts[0] if segment_texts else "",
-                        position=0,
-                        num_videos=len(segment_texts),
-                        api_key=api_key,
-                        model=model,
-                        reference_image_info=reference_image_info
-                    )
-                except Exception as e:
-                    print(f"⚠️  Failed to generate opening still image prompt: {e}")
-                    opening_prompt = f"A hyperrealistic, photorealistic, high-quality opening still image, as if photographed by a professional documentary photographer, representing the video topic: {script[:200] if script else 'documentary introduction'}. Make it look like a real photograph with natural lighting, realistic textures, and maximum detail."
+        # Validate and enrich segment assignments
+        # CRITICAL: Segment 1 MUST be a video, never a still image
+        validated_assignments = []
+        for assignment in segment_assignments_raw:
+            segment_id = assignment.get('segment_id')
+            if 1 <= segment_id <= len(segment_texts):
+                seg_type = assignment.get('type', 'video')
                 
-                validated_segments.insert(0, {
-                    'segment_id': 0,
-                    'segment_text': segment_texts[0] if segment_texts else "",
-                    'image_prompt': opening_prompt,
-                    'duration': 12.0,  # Opening still images are always 12 seconds
-                    'reasoning': "Opening still image (test mode)"
+                # CRITICAL: Force segment 1 to be a video
+                if segment_id == 1 and seg_type == 'still':
+                    print(f"⚠️  Warning: Segment 1 was assigned as still image, but it MUST be a video. Changing to video.")
+                    seg_type = 'video'
+                
+                ref_id = assignment.get('reference_image_id')
+                # Validate reference_image_id exists in reference_images list
+                if ref_id and reference_images:
+                    # Check if this reference image ID actually exists
+                    ref_ids = [ref.get('id') for ref in reference_images]
+                    if ref_id not in ref_ids:
+                        print(f"⚠️  Warning: Segment {segment_id} assigned invalid reference_image_id '{ref_id}', setting to None")
+                        ref_id = None
+                
+                validated_assignments.append({
+                    'segment_id': segment_id,
+                    'type': seg_type,  # 'still' or 'video' (forced to 'video' for segment 1)
+                    'reference_image_id': ref_id  # ID or null
                 })
         
-        return validated_segments
+        # Ensure we have assignments for all segments
+        if len(validated_assignments) < len(segment_texts):
+            # Fill in missing segments as videos with no reference image
+            existing_ids = {a['segment_id'] for a in validated_assignments}
+            for i in range(1, len(segment_texts) + 1):
+                if i not in existing_ids:
+                    validated_assignments.append({
+                        'segment_id': i,
+                        'type': 'video',
+                        'reference_image_id': None
+                    })
+        
+        # CRITICAL: Ensure segment 1 is always a video (double-check)
+        for assignment in validated_assignments:
+            if assignment['segment_id'] == 1 and assignment['type'] == 'still':
+                print(f"⚠️  Warning: Segment 1 was still marked as still image after validation. Forcing to video.")
+                assignment['type'] = 'video'
+        
+        # Sort assignments by segment_id
+        validated_assignments.sort(key=lambda x: x['segment_id'])
+        
+        # Validation: If reference images exist, warn if none are being used
+        if reference_images and len(reference_images) > 0:
+            video_segments_with_ref = [a for a in validated_assignments if a.get('type') == 'video' and a.get('reference_image_id')]
+            if len(video_segments_with_ref) == 0:
+                print(f"⚠️  WARNING: {len(reference_images)} reference image(s) were identified, but NONE are being assigned to video segments!")
+                print(f"   This may indicate the AI is being too conservative. Reference images should be used for visual consistency.")
+                print(f"   Available reference images: {[ref.get('id') for ref in reference_images]}")
+            else:
+                print(f"✅ {len(video_segments_with_ref)} video segment(s) assigned reference images out of {len([a for a in validated_assignments if a.get('type') == 'video'])} total video segments")
+        
+        return {
+            'still_image_segments': validated_still_segments,
+            'segment_assignments': validated_assignments
+        }
         
     except Exception as e:
         print(f"⚠️  Script analysis for still images failed: {e}")
-        # If test mode and analysis failed, at least add opening still image
-        if test:
-            try:
-                opening_prompt = generate_still_image_prompt(
-                    script=script,
-                    context_segment=segment_texts[0] if segment_texts else "",
-                    position=0,
-                    num_videos=len(segment_texts),
-                    api_key=api_key,
-                    model=model,
-                    reference_image_info=reference_image_info
-                )
-                return [{
-                    'segment_id': 0,
-                    'segment_text': segment_texts[0] if segment_texts else "",
-                    'image_prompt': opening_prompt,
-                    'duration': 12.0,
-                    'reasoning': "Opening still image (test mode - fallback)"
-                }]
-            except:
-                pass
-        return []  # Return empty list if analysis fails
+        # Return empty structure if analysis fails
+        return {
+            'still_image_segments': [],
+            'segment_assignments': [{'segment_id': i, 'type': 'video', 'reference_image_id': None} for i in range(1, len(segment_texts) + 1)]
+        }
 
 
 def create_panning_video_from_image(image_path, output_path, duration, pan_direction='top_left_to_bottom_right', ffmpeg_path=None):
@@ -3463,22 +4150,26 @@ def create_panning_video_from_image(image_path, output_path, duration, pan_direc
         adjusted_max_pan_w = max(0, scaled_w - crop_w)
         adjusted_max_pan_h = max(0, scaled_h - crop_h)
         
-        # Recalculate corner positions with adjusted pan distances
+        # Reduce pan distance to make it slower (pan only 60% of the way instead of full corner-to-corner)
+        # This makes the panning appear slower while maintaining the same direction
+        pan_distance_factor = 0.6  # Pan only 60% of the maximum distance (slower movement)
+        
+        # Recalculate corner positions with reduced pan distances for slower movement
         if pan_direction == 'top_left_to_bottom_right':
             start_pos = (0, 0)
-            end_pos = (adjusted_max_pan_w, adjusted_max_pan_h)
+            end_pos = (int(adjusted_max_pan_w * pan_distance_factor), int(adjusted_max_pan_h * pan_distance_factor))
         elif pan_direction == 'top_right_to_bottom_left':
             start_pos = (adjusted_max_pan_w, 0)
-            end_pos = (0, adjusted_max_pan_h)
+            end_pos = (int(adjusted_max_pan_w * (1 - pan_distance_factor)), int(adjusted_max_pan_h * pan_distance_factor))
         elif pan_direction == 'bottom_left_to_top_right':
             start_pos = (0, adjusted_max_pan_h)
-            end_pos = (adjusted_max_pan_w, 0)
+            end_pos = (int(adjusted_max_pan_w * pan_distance_factor), int(adjusted_max_pan_h * (1 - pan_distance_factor)))
         elif pan_direction == 'bottom_right_to_top_left':
             start_pos = (adjusted_max_pan_w, adjusted_max_pan_h)
-            end_pos = (0, 0)
+            end_pos = (int(adjusted_max_pan_w * (1 - pan_distance_factor)), int(adjusted_max_pan_h * (1 - pan_distance_factor)))
         else:
             start_pos = (0, 0)
-            end_pos = (adjusted_max_pan_w, adjusted_max_pan_h)
+            end_pos = (int(adjusted_max_pan_w * pan_distance_factor), int(adjusted_max_pan_h * pan_distance_factor))
         
         def transform_func(get_frame, t):
             # Linear interpolation for straight-line movement (no easing)
@@ -3559,51 +4250,65 @@ def create_panning_video_from_image(image_path, output_path, duration, pan_direc
         adjusted_max_pan_w = max(0, scale_w - crop_w)
         adjusted_max_pan_h = max(0, scale_h - crop_h)
         
+        # Reduce pan distance to make it slower (pan only 60% of the way instead of full corner-to-corner)
+        # This makes the panning appear slower while maintaining the same direction
+        pan_distance_factor = 0.6  # Pan only 60% of the maximum distance (slower movement)
+        reduced_pan_w = int(adjusted_max_pan_w * pan_distance_factor)
+        reduced_pan_h = int(adjusted_max_pan_h * pan_distance_factor)
+        
         # Use crop filter with linear interpolation for straight-line corner-to-corner panning
         # Crop larger area and scale down to show more of the original image
         if pan_direction == 'top_left_to_bottom_right':
-            # Pan from top-left to bottom-right (straight diagonal line)
+            # Pan from top-left to bottom-right (straight diagonal line, but slower - only 60% distance)
             filter_complex = (
                 f"scale={scale_w}:{scale_h},"
                 f"crop={crop_w}:{crop_h}:"
-                f"'t*{adjusted_max_pan_w}/{duration}':"
-                f"'t*{adjusted_max_pan_h}/{duration}',"
+                f"'t*{reduced_pan_w}/{duration}':"
+                f"'t*{reduced_pan_h}/{duration}',"
                 f"scale={output_w}:{output_h}"
             )
         elif pan_direction == 'top_right_to_bottom_left':
-            # Pan from top-right to bottom-left (straight diagonal line)
+            # Pan from top-right to bottom-left (straight diagonal line, but slower - only 60% distance)
+            start_x = adjusted_max_pan_w
+            end_x = int(adjusted_max_pan_w * (1 - pan_distance_factor))
             filter_complex = (
                 f"scale={scale_w}:{scale_h},"
                 f"crop={crop_w}:{crop_h}:"
-                f"'{adjusted_max_pan_w}-t*{adjusted_max_pan_w}/{duration}':"
-                f"'t*{adjusted_max_pan_h}/{duration}',"
+                f"'{start_x}-t*{start_x-end_x}/{duration}':"
+                f"'t*{reduced_pan_h}/{duration}',"
                 f"scale={output_w}:{output_h}"
             )
         elif pan_direction == 'bottom_left_to_top_right':
-            # Pan from bottom-left to top-right (straight diagonal line)
+            # Pan from bottom-left to top-right (straight diagonal line, but slower - only 60% distance)
+            start_y = adjusted_max_pan_h
+            end_y = int(adjusted_max_pan_h * (1 - pan_distance_factor))
             filter_complex = (
                 f"scale={scale_w}:{scale_h},"
                 f"crop={crop_w}:{crop_h}:"
-                f"'t*{adjusted_max_pan_w}/{duration}':"
-                f"'{adjusted_max_pan_h}-t*{adjusted_max_pan_h}/{duration}',"
+                f"'t*{reduced_pan_w}/{duration}':"
+                f"'{start_y}-t*{start_y-end_y}/{duration}',"
                 f"scale={output_w}:{output_h}"
             )
         elif pan_direction == 'bottom_right_to_top_left':
-            # Pan from bottom-right to top-left (straight diagonal line)
+            # Pan from bottom-right to top-left (straight diagonal line, but slower - only 60% distance)
+            start_x = adjusted_max_pan_w
+            start_y = adjusted_max_pan_h
+            end_x = int(adjusted_max_pan_w * (1 - pan_distance_factor))
+            end_y = int(adjusted_max_pan_h * (1 - pan_distance_factor))
             filter_complex = (
                 f"scale={scale_w}:{scale_h},"
                 f"crop={crop_w}:{crop_h}:"
-                f"'{adjusted_max_pan_w}-t*{adjusted_max_pan_w}/{duration}':"
-                f"'{adjusted_max_pan_h}-t*{adjusted_max_pan_h}/{duration}',"
+                f"'{start_x}-t*{start_x-end_x}/{duration}':"
+                f"'{start_y}-t*{start_y-end_y}/{duration}',"
                 f"scale={output_w}:{output_h}"
             )
         else:
-            # Default: top-left to bottom-right (straight diagonal line)
+            # Default: top-left to bottom-right (straight diagonal line, but slower - only 60% distance)
             filter_complex = (
                 f"scale={scale_w}:{scale_h},"
                 f"crop={crop_w}:{crop_h}:"
-                f"'t*{adjusted_max_pan_w}/{duration}':"
-                f"'t*{adjusted_max_pan_h}/{duration}',"
+                f"'t*{reduced_pan_w}/{duration}':"
+                f"'t*{reduced_pan_h}/{duration}',"
                 f"scale={output_w}:{output_h}"
             )
         
@@ -3731,7 +4436,8 @@ def start_video_generation_job(
             response = client.videos.create(model=model, prompt=prompt)
             return response.id
         except Exception as e2:
-            raise Exception(f"Failed to start video generation job: {e2}")
+            # Re-raise original exception to preserve error code and other attributes
+            raise e2
     except Exception as e:
         # If reference image causes issues, try without it
         if reference_image_path:
@@ -3744,9 +4450,11 @@ def start_video_generation_job(
                 response = client.videos.create(**params_no_ref)
                 return response.id
             except Exception as e2:
-                raise Exception(f"Failed to start video generation job: {e2}")
+                # Re-raise original exception to preserve error code and other attributes
+                raise e2
         else:
-            raise Exception(f"Failed to start video generation job: {e}")
+            # Re-raise original exception to preserve error code and other attributes
+            raise e
 
 
 def wait_for_video_completion(
@@ -3809,8 +4517,24 @@ def wait_for_video_completion(
                 return output_path
                 
             elif status == 'failed':
-                error_msg = getattr(status_response, 'error', 'Unknown error')
-                raise Exception(f"Video generation failed for job {video_id}: {error_msg}")
+                error_obj = getattr(status_response, 'error', 'Unknown error')
+                # Extract error message and code if available
+                if isinstance(error_obj, dict):
+                    error_msg = error_obj.get('message', str(error_obj))
+                    error_code = error_obj.get('code', None)
+                elif hasattr(error_obj, 'message') and hasattr(error_obj, 'code'):
+                    error_msg = error_obj.message
+                    error_code = error_obj.code
+                else:
+                    error_msg = str(error_obj)
+                    error_code = None
+                
+                # Create exception with error code if available
+                exception_msg = f"Video generation failed for job {video_id}: {error_msg}"
+                exception = Exception(exception_msg)
+                if error_code:
+                    exception.code = error_code
+                raise exception
             
             time.sleep(poll_interval)
             
@@ -4010,7 +4734,8 @@ def stitch_videos(video_paths, output_path, ffmpeg_path=None):
                 escaped_path = video_path.replace("'", "'\\''").replace("\\", "/")
                 f.write(f"file '{escaped_path}'\n")
         
-        # Build ffmpeg command for concatenation
+        # First, stitch videos together
+        temp_stitched = os.path.join(temp_dir, f"stitched_temp_{timestamp}.mp4")
         cmd = [
             ffmpeg_path,
             '-f', 'concat',
@@ -4018,10 +4743,10 @@ def stitch_videos(video_paths, output_path, ffmpeg_path=None):
             '-i', concat_file,
             '-c', 'copy',  # Copy streams without re-encoding (faster)
             '-y',  # Overwrite output file
-            output_path
+            temp_stitched
         ]
         
-        # Run ffmpeg
+        # Run ffmpeg to stitch
         process = subprocess.run(
             cmd,
             stdout=subprocess.PIPE,
@@ -4029,6 +4754,59 @@ def stitch_videos(video_paths, output_path, ffmpeg_path=None):
             text=True,
             check=True
         )
+        
+        # Now apply fade in to first second and fade out to last second
+        print(f"   Applying fade in (1s) and fade out (1s)...")
+        video_duration = get_media_duration(temp_stitched, ffmpeg_path)
+        if video_duration and video_duration > 2.0:  # Only apply fades if video is longer than 2 seconds
+            # Apply fade in (first 1 second) and fade out (last 1 second)
+            fade_out_start = max(0, video_duration - 1.0)
+            cmd_fade = [
+                ffmpeg_path,
+                '-i', temp_stitched,
+                '-vf', f'fade=t=in:st=0:d=1,fade=t=out:st={fade_out_start}:d=1',  # Fade in 1s, fade out 1s
+                '-c:v', 'libx264',
+                '-preset', 'medium',
+                '-crf', '23',
+                '-c:a', 'copy',  # Copy audio without re-encoding
+                '-y',
+                output_path
+            ]
+            
+            try:
+                subprocess.run(
+                    cmd_fade,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    check=True
+                )
+                print(f"   ✅ Fade in/out applied successfully")
+                # Clean up temp file
+                if os.path.exists(temp_stitched):
+                    try:
+                        os.remove(temp_stitched)
+                    except:
+                        pass
+            except subprocess.CalledProcessError as e:
+                print(f"   ⚠️  Fade application failed: {e.stderr if e.stderr else 'Unknown error'}")
+                print(f"   Using stitched video without fade effects")
+                import shutil
+                shutil.copy2(temp_stitched, output_path)
+                if os.path.exists(temp_stitched):
+                    try:
+                        os.remove(temp_stitched)
+                    except:
+                        pass
+        else:
+            # Video is too short for fades, just copy
+            import shutil
+            shutil.copy2(temp_stitched, output_path)
+            if os.path.exists(temp_stitched):
+                try:
+                    os.remove(temp_stitched)
+                except:
+                    pass
         
         print(f"✅ Videos stitched successfully to: {output_path}")
         return output_path
@@ -4047,16 +4825,18 @@ def stitch_videos(video_paths, output_path, ffmpeg_path=None):
                 pass
 
 
-def generate_srt_from_audio(audio_path, script, output_path=None, api_key=None):
+def generate_srt_from_audio(audio_path, script, output_path=None, api_key=None, segment_duration=12.0):
     """
-    Generate an SRT subtitle file with word-level timestamps using OpenAI Whisper API.
-    This provides exact synchronization between captions and audio.
+    Generate an SRT subtitle file with word-by-word timing using OpenAI Whisper API.
+    Displays 1-2 words at a time as they are narrated, with words always side by side.
+    Uses word-level timestamps for precise synchronization between captions and audio.
     
     Args:
         audio_path: Path to the audio file (voiceover) to analyze
         script: The narration script text (for reference/validation)
         output_path: Path to save the SRT file (default: temp file)
         api_key: OpenAI API key (if None, uses OPENAI_API_KEY env var or global)
+        segment_duration: Not used (kept for compatibility, word-level timing is used instead)
         
     Returns:
         Path to the generated SRT file, or None if generation fails
@@ -4138,170 +4918,94 @@ def generate_srt_from_audio(audio_path, script, output_path=None, api_key=None):
             millis = int((seconds % 1) * 1000)
             return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
         
-        # Generate SRT content - split by sentences, preserve punctuation
-        # First, identify sentence boundaries by checking for punctuation in words
-        import re
+        # Create word-by-word subtitles (1-2 words at a time, side by side)
         srt_content = []
         subtitle_index = 1
         
-        # Process words and identify sentence endings
+        # Parse words with their timestamps
         word_list = []
         for word_data in words:
             # Extract word and timing
             if isinstance(word_data, dict):
                 word = word_data.get('word', '').strip()
                 start = word_data.get('start', 0)
-                end = word_data.get('end', start + 0.3)  # Default 0.3s if end not provided
+                end = word_data.get('end', start + 0.3)
             else:
-                # Handle object attributes
                 word = getattr(word_data, 'word', '').strip()
                 start = getattr(word_data, 'start', 0)
                 end = getattr(word_data, 'end', start + 0.3)
             
-            if not word:
-                continue
-            
-            # Ensure minimum display time for readability (0.35 seconds)
-            min_display_time = 0.35
-            word_duration = end - start
-            if word_duration < min_display_time:
-                # Extend end time to meet minimum
-                end = start + min_display_time
-            
-            # Check if this word ends a sentence (contains sentence-ending punctuation)
-            is_sentence_end = bool(re.search(r'[.!?]+', word))
-            
-            word_list.append({'word': word, 'start': start, 'end': end, 'is_sentence_end': is_sentence_end})
+            if word:
+                word_list.append({
+                    'word': word,
+                    'start': start,
+                    'end': end
+                })
         
-        # Create subtitles: split by sentences, ensure sentence ends on its own line
-        # Track the end time of the previous subtitle to ensure no overlap
-        last_end_time = 0.0
-        MIN_GAP = 0.02  # Minimum gap between subtitles (20ms) to prevent any overlap
-        SENTENCE_GAP = 0.1  # Gap between sentences (100ms)
+        if not word_list:
+            print("⚠️  No words found in transcription")
+            return None
         
-        if word_list:
-            i = 0
-            current_sentence_words = []
+        # Generate subtitles with new requirements:
+        # 1. Words appear at exact transcription timestamps (no delay)
+        # 2. Each word stays on screen for exactly 0.75 seconds
+        # 3. Words accumulate and grow horizontally (centered)
+        # 4. Words are always side by side (never stacked)
+        
+        WORD_DISPLAY_DURATION = 0.75  # Each word stays on screen for 0.75 seconds
+        
+        # Create time intervals where subtitles need to be updated
+        # Each word creates an interval: [start_time, start_time + 0.75]
+        time_points = set()
+        for word in word_list:
+            time_points.add(word['start'])
+            time_points.add(word['start'] + WORD_DISPLAY_DURATION)
+        
+        # Sort time points
+        sorted_times = sorted(time_points)
+        
+        # For each time point, determine which words should be visible
+        # A word is visible if: start_time <= current_time < start_time + 0.75
+        for i, current_time in enumerate(sorted_times):
+            # Find all words visible at this time
+            visible_words = []
+            for word in word_list:
+                word_start = word['start']
+                word_end = word_start + WORD_DISPLAY_DURATION
+                # Word is visible if current_time is within its display window
+                if word_start <= current_time < word_end:
+                    visible_words.append(word)
             
-            while i < len(word_list):
-                word_data = word_list[i]
-                word = word_data['word']
-                audio_start = word_data['start']
-                audio_end = word_data['end']
-                is_sentence_end = word_data['is_sentence_end']
+            # Only create subtitle entry if there are visible words
+            if visible_words:
+                # Sort visible words by their start time to maintain order
+                visible_words.sort(key=lambda w: w['start'])
                 
-                # Add word to current sentence
-                current_sentence_words.append(word_data)
+                # Create text with words side by side (space-separated, single line)
+                word_text = " ".join([w['word'] for w in visible_words])
                 
-                # If this is the end of a sentence, process the entire sentence
-                if is_sentence_end or i == len(word_list) - 1:
-                    # Process all words in this sentence
-                    j = 0
-                    while j < len(current_sentence_words):
-                        sentence_word_data = current_sentence_words[j]
-                        sentence_word = sentence_word_data['word']
-                        sentence_audio_start = sentence_word_data['start']
-                        sentence_audio_end = sentence_word_data['end']
-                        is_last_in_sentence = (j == len(current_sentence_words) - 1)
-                        
-                        # CRITICAL: Start time must be after previous subtitle ends (with gap)
-                        subtitle_start = max(sentence_audio_start, last_end_time + MIN_GAP)
-                        
-                        # Ensure minimum display time
-                        min_end = subtitle_start + 0.35
-                        subtitle_end = max(sentence_audio_end, min_end)
-                        
-                        # If this is the last word in the sentence, it MUST be on its own line
-                        if is_last_in_sentence:
-                            # Last word of sentence - ensure it displays long enough
-                            if subtitle_end - subtitle_start < 0.5:
-                                subtitle_end = subtitle_start + 0.5
-                            
-                            srt_content.append(f"{subtitle_index}")
-                            srt_content.append(f"{format_srt_time(subtitle_start)} --> {format_srt_time(subtitle_end)}")
-                            srt_content.append(sentence_word)  # Includes punctuation
-                            srt_content.append("")  # Empty line between entries
-                            subtitle_index += 1
-                            
-                            # CRITICAL: Update last_end_time - next sentence MUST start after this ends + gap
-                            last_end_time = subtitle_end + SENTENCE_GAP
-                            j += 1
-                        else:
-                            # Not the last word - can group with next word in sentence (max 2 words)
-                            next_sentence_word_data = current_sentence_words[j + 1] if j + 1 < len(current_sentence_words) else None
-                            
-                            if next_sentence_word_data and not next_sentence_word_data['is_sentence_end']:
-                                # Group 2 words together (but not if next is sentence end)
-                                next_word = next_sentence_word_data['word']
-                                next_audio_start = next_sentence_word_data['start']
-                                next_audio_end = next_sentence_word_data['end']
-                                
-                                # Group if next word starts within 0.2s of current word's end
-                                if next_audio_start <= sentence_audio_end + 0.2:
-                                    group_text = f"{sentence_word} {next_word}"
-                                    group_start = subtitle_start
-                                    group_end = max(subtitle_end, next_audio_end)
-                                    # Ensure minimum display time for 2 words
-                                    if group_end - group_start < 0.5:
-                                        group_end = group_start + 0.5
-                                    
-                                    # Check if there's a word after this group
-                                    next_next_word_data = current_sentence_words[j + 2] if j + 2 < len(current_sentence_words) else None
-                                    if next_next_word_data:
-                                        # Next subtitle must start after this one ends + gap
-                                        next_subtitle_start = max(next_next_word_data['start'], group_end + MIN_GAP)
-                                        # Ensure current subtitle ends before next starts
-                                        if group_end >= next_subtitle_start:
-                                            group_end = next_subtitle_start - MIN_GAP
-                                            # But maintain minimum duration
-                                            if group_end - group_start < 0.5:
-                                                group_end = group_start + 0.5
-                                    
-                                    srt_content.append(f"{subtitle_index}")
-                                    srt_content.append(f"{format_srt_time(group_start)} --> {format_srt_time(group_end)}")
-                                    srt_content.append(group_text)
-                                    srt_content.append("")  # Empty line between entries
-                                    subtitle_index += 1
-                                    
-                                    # CRITICAL: Update last_end_time
-                                    last_end_time = group_end
-                                    
-                                    # Skip next word since we've already included it
-                                    j += 2
-                                    continue
-                            
-                            # Single word subtitle (not last in sentence)
-                            # CRITICAL: Check when next subtitle would start
-                            if next_sentence_word_data:
-                                # Next subtitle should start after current ends + gap
-                                next_subtitle_start = max(next_sentence_word_data['start'], subtitle_end + MIN_GAP)
-                                # Ensure current subtitle ends before next starts
-                                if subtitle_end >= next_subtitle_start:
-                                    subtitle_end = next_subtitle_start - MIN_GAP
-                                    # But maintain minimum duration
-                                    if subtitle_end - subtitle_start < 0.35:
-                                        subtitle_end = subtitle_start + 0.35
-                            
-                            srt_content.append(f"{subtitle_index}")
-                            srt_content.append(f"{format_srt_time(subtitle_start)} --> {format_srt_time(subtitle_end)}")
-                            srt_content.append(sentence_word)
-                            srt_content.append("")  # Empty line between entries
-                            subtitle_index += 1
-                            
-                            # CRITICAL: Update last_end_time
-                            last_end_time = subtitle_end
-                            j += 1
-                    
-                    # Clear sentence words and move to next sentence
-                    current_sentence_words = []
+                # Determine the time range for this subtitle entry
+                # Start: current time point
+                # End: next time point (or end of video if this is the last)
+                start_time = current_time
+                if i + 1 < len(sorted_times):
+                    end_time = sorted_times[i + 1]
+                else:
+                    # Last time point - extend to the last word's end time
+                    end_time = max([w['start'] + WORD_DISPLAY_DURATION for w in visible_words])
                 
-                i += 1
+                # Create SRT entry (words always side by side, not stacked)
+                srt_content.append(f"{subtitle_index}")
+                srt_content.append(f"{format_srt_time(start_time)} --> {format_srt_time(end_time)}")
+                srt_content.append(word_text)  # Single line, words side by side, centered
+                srt_content.append("")  # Empty line between entries
+                subtitle_index += 1
         
         # Write SRT file
         with open(output_path, 'w', encoding='utf-8') as f:
             f.write('\n'.join(srt_content))
         
-        print(f"✅ Generated SRT with {subtitle_index - 1} word-level timestamps")
+        print(f"✅ Generated SRT with {subtitle_index - 1} subtitle entries (words accumulate horizontally, 0.75s display duration)")
         return output_path
         
     except Exception as e:
@@ -4378,13 +5082,17 @@ def generate_srt_from_script(script, video_duration, output_path=None):
         millis = int((seconds % 1) * 1000)
         return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
     
-    # Generate SRT content - split by sentences, ensure sentence ends on its own line
-    srt_content = []
+    # Generate SRT content with new requirements:
+    # 1. Words appear at estimated timestamps (no delay, based on reading speed)
+    # 2. Each word stays on screen for exactly 0.75 seconds
+    # 3. Words accumulate and grow horizontally (centered)
+    # 4. Words are always side by side (never stacked)
+    
+    WORD_DISPLAY_DURATION = 0.75  # Each word stays on screen for 0.75 seconds
+    
+    # Build word list with estimated timestamps
+    word_list = []
     current_time = 0.2  # Start slightly earlier (0.2 seconds in)
-    subtitle_index = 1
-    MIN_GAP = 0.01  # Minimum gap between subtitles (10ms) to prevent any overlap
-    SENTENCE_GAP = 0.1  # Gap between sentences (100ms)
-    last_end_time = 0.0
     
     for sentence in sentence_list:
         # Preserve punctuation - don't remove it
@@ -4394,17 +5102,12 @@ def generate_srt_from_script(script, video_duration, output_path=None):
             continue
         
         # Split sentence into words (preserving punctuation attached to words)
-        # Use regex to split on whitespace but keep punctuation with words
         words = re.findall(r'\S+', sentence)
         
         if not words:
             continue
         
-        # Check if last word ends with sentence-ending punctuation
-        last_word = words[-1]
-        is_sentence_end = bool(re.search(r'[.!?]+', last_word))
-        
-        # Calculate total duration for this sentence
+        # Calculate timing for each word in this sentence
         word_count = len(words)
         pause_count = sentence.count('...') + sentence.count('..') + sentence.count('—') + sentence.count('-')
         pause_duration = pause_count * 0.5  # Each pause adds 0.5 seconds
@@ -4421,72 +5124,72 @@ def generate_srt_from_script(script, video_duration, output_path=None):
             sentence_duration = max(0.3, video_duration - current_time - 0.2)
         
         # Calculate duration per word
-        word_duration = sentence_duration / word_count
+        word_duration = sentence_duration / word_count if word_count > 0 else 0.4
         word_duration = min(0.7, max(0.35, word_duration))  # 0.35-0.7 seconds per word
         
-        # Process words in this sentence
-        word_idx = 0
-        while word_idx < len(words):
+        # Add words with estimated start times
+        for word in words:
             if current_time >= video_duration - 0.2:
                 break
+            word_list.append({
+                'word': word,
+                'start': current_time,
+                'end': current_time + word_duration
+            })
+            current_time += word_duration
+    
+    if not word_list:
+        return None
+    
+    # Create time intervals where subtitles need to be updated (same logic as audio-based)
+    time_points = set()
+    for word in word_list:
+        time_points.add(word['start'])
+        time_points.add(word['start'] + WORD_DISPLAY_DURATION)
+    
+    # Sort time points
+    sorted_times = sorted(time_points)
+    
+    # For each time point, determine which words should be visible
+    srt_content = []
+    subtitle_index = 1
+    
+    for i, current_time in enumerate(sorted_times):
+        # Find all words visible at this time
+        visible_words = []
+        for word in word_list:
+            word_start = word['start']
+            word_end = word_start + WORD_DISPLAY_DURATION
+            # Word is visible if current_time is within its display window
+            if word_start <= current_time < word_end:
+                visible_words.append(word)
+        
+        # Only create subtitle entry if there are visible words
+        if visible_words:
+            # Sort visible words by their start time to maintain order
+            visible_words.sort(key=lambda w: w['start'])
             
-            current_word = words[word_idx]
-            is_last_word = (word_idx == len(words) - 1)
+            # Create text with words side by side (space-separated, single line)
+            word_text = " ".join([w['word'] for w in visible_words])
             
-            # If this is the last word in the sentence, it MUST be on its own line
-            if is_last_word:
-                # Last word of sentence - ensure it displays long enough
-                start_time = max(current_time, last_end_time + MIN_GAP)
-                end_time = start_time + max(word_duration, 0.5)  # At least 0.5s for last word
-                end_time = min(end_time, video_duration - 0.1)
-                
+            # Determine the time range for this subtitle entry
+            start_time = current_time
+            if i + 1 < len(sorted_times):
+                end_time = sorted_times[i + 1]
+            else:
+                # Last time point - extend to the last word's end time
+                end_time = max([w['start'] + WORD_DISPLAY_DURATION for w in visible_words])
+            
+            # Don't exceed video duration
+            end_time = min(end_time, video_duration - 0.1)
+            
+            if start_time < end_time:
+                # Create SRT entry (words always side by side, not stacked)
                 srt_content.append(f"{subtitle_index}")
                 srt_content.append(f"{format_srt_time(start_time)} --> {format_srt_time(end_time)}")
-                srt_content.append(current_word)  # Includes punctuation
+                srt_content.append(word_text)  # Single line, words side by side, centered
                 srt_content.append("")  # Empty line between entries
                 subtitle_index += 1
-                
-                # CRITICAL: Update last_end_time - next sentence MUST start after this ends + gap
-                last_end_time = end_time + SENTENCE_GAP
-                current_time = last_end_time
-                word_idx += 1
-            else:
-                # Not the last word - can group with next word (max 2 words)
-                next_word = words[word_idx + 1] if word_idx + 1 < len(words) else None
-                
-                if next_word and word_idx + 1 < len(words) - 1:  # Don't group if next is last word
-                    # Group 2 words together
-                    group_text = f"{current_word} {next_word}"
-                    start_time = max(current_time, last_end_time + MIN_GAP)
-                    end_time = start_time + (word_duration * 1.8)  # Slightly longer for 2 words
-                    end_time = min(end_time, video_duration - 0.1)
-                    
-                    srt_content.append(f"{subtitle_index}")
-                    srt_content.append(f"{format_srt_time(start_time)} --> {format_srt_time(end_time)}")
-                    srt_content.append(group_text)
-                    srt_content.append("")  # Empty line between entries
-                    subtitle_index += 1
-                    
-                    # Move to next subtitle start time (end of current + gap)
-                    last_end_time = end_time
-                    current_time = end_time + MIN_GAP
-                    word_idx += 2  # Skip both words
-                else:
-                    # Single word subtitle (not last in sentence)
-                    start_time = max(current_time, last_end_time + MIN_GAP)
-                    end_time = start_time + word_duration
-                    end_time = min(end_time, video_duration - 0.1)
-                    
-                    srt_content.append(f"{subtitle_index}")
-                    srt_content.append(f"{format_srt_time(start_time)} --> {format_srt_time(end_time)}")
-                    srt_content.append(current_word)
-                    srt_content.append("")  # Empty line between entries
-                    subtitle_index += 1
-                    
-                    # Move to next subtitle start time (end of current + gap)
-                    last_end_time = end_time
-                    current_time = end_time + MIN_GAP
-                    word_idx += 1
     
     # Write SRT file
     try:
@@ -4547,6 +5250,10 @@ def add_subtitles_to_video(video_path, script, video_duration, output_path=None,
     
     if output_path is None:
         base, ext = os.path.splitext(video_path)
+        # If video already has "_with_subtitles" in the name, remove it first to avoid duplicates
+        if "_with_subtitles" in base:
+            # Remove the last occurrence of "_with_subtitles" and any trailing numbers
+            base = base.rsplit("_with_subtitles", 1)[0]
         output_path = f"{base}_with_subtitles{ext}"
     
     import tempfile
@@ -4572,7 +5279,7 @@ def add_subtitles_to_video(video_path, script, video_duration, output_path=None,
         
         # FFmpeg subtitle styling
         # Professional, clean appearance suitable for YouTube
-        # Much lower on screen, refined typography
+        # Centered, horizontal growth as words accumulate
         subtitle_style = (
             "FontName=Segoe UI,"
             "FontSize=20,"
@@ -4754,101 +5461,38 @@ def generate_and_upload_sora(
     print(f"Prompt: {prompt}")
     print(f"Model: {model}")
     
-    # Calculate segment duration early (needed for display)
+    # Simple duration validation: must be divisible by 12
+    if duration % 12 != 0:
+        raise ValueError(f"Duration must be divisible by 12. Provided duration: {duration} seconds")
+    
     # Fixed parameters
-    VIDEO_SEGMENT_DURATION = 12.0  # Fixed 12-second video segments
-    STILL_IMAGE_DURATION = 12.0  # Fixed 12-second still images
-    VIDEOS_PER_STILL = 3  # Still image after every 3 videos
+    SEGMENT_DURATION = 12.0  # Each segment is 12 seconds (video or still)
     
-    # Calculate number of video segments and still images to match input duration exactly
-    # Target: 1/3 of duration should be still images (max 1/3)
-    # Formula: total_duration = (num_videos * 12) + (num_still * 12)
-    # Where we want: num_still * 12 ≈ total_duration / 3 (but not more than 1/3)
+    # Calculate total number of segments (each segment is 12 seconds)
+    num_segments = int(duration / 12)
     
-    # If test mode, we need an extra still image at the beginning
-    opening_still_duration = STILL_IMAGE_DURATION if test else 0
+    # Calculate number of still images (approximately 1/3 of segments)
+    num_still_images = max(1, int(num_segments / 3))
     
-    # Calculate target still image duration (1/3 of total, but not more)
-    target_still_duration = duration / 3.0
-    max_still_duration = duration / 3.0  # Hard cap at 1/3
+    # Calculate number of video segments (approximately 2/3 of segments)
+    num_videos = num_segments - num_still_images
     
-    # Calculate ideal number of still images based on 1/3 target
-    ideal_num_stills = int(target_still_duration / STILL_IMAGE_DURATION)
-    # Ensure we don't exceed 1/3
-    max_stills_by_duration = int(max_still_duration / STILL_IMAGE_DURATION)
-    ideal_num_stills = min(ideal_num_stills, max_stills_by_duration, 1)  # At least 1 if duration >= 24
+    # Ensure we have at least 1 video segment
+    if num_videos < 1:
+        num_videos = 1
+        num_still_images = num_segments - num_videos
     
-    # Calculate remaining duration for video segments
-    # Account for opening still if in test mode
-    remaining_duration = duration - (ideal_num_stills * STILL_IMAGE_DURATION) - opening_still_duration
+    segment_duration = SEGMENT_DURATION
     
-    # Calculate how many 12-second video segments fit in remaining duration
-    num_videos = int(remaining_duration / VIDEO_SEGMENT_DURATION)
-    
-    # Recalculate total to ensure it matches input duration exactly
-    total_still_duration = ideal_num_stills * STILL_IMAGE_DURATION
-    total_video_duration = num_videos * VIDEO_SEGMENT_DURATION
-    calculated_total = total_video_duration + total_still_duration + opening_still_duration
-    
-    # If we're under the target duration, try to add more still images or videos
-    if calculated_total < duration:
-        # First, try adding more still images (up to 1/3 limit)
-        remaining_time = duration - calculated_total
-        additional_stills = int(remaining_time / STILL_IMAGE_DURATION)
-        max_additional = max_stills_by_duration - ideal_num_stills
-        additional_stills = min(additional_stills, max_additional)
-        
-        if additional_stills > 0:
-            ideal_num_stills += additional_stills
-            total_still_duration = ideal_num_stills * STILL_IMAGE_DURATION
-            remaining_duration = duration - total_still_duration - opening_still_duration
-            num_videos = int(remaining_duration / VIDEO_SEGMENT_DURATION)
-            total_video_duration = num_videos * VIDEO_SEGMENT_DURATION
-            calculated_total = total_video_duration + total_still_duration + opening_still_duration
-        
-        # If still under, try adding one more video segment if it fits
-        if calculated_total < duration:
-            remaining_time = duration - calculated_total
-            if remaining_time >= VIDEO_SEGMENT_DURATION:
-                num_videos += 1
-                total_video_duration = num_videos * VIDEO_SEGMENT_DURATION
-                calculated_total = total_video_duration + total_still_duration + opening_still_duration
-    
-    # Final calculation with opening still
-    num_still_images = ideal_num_stills
-    if test:
-        num_still_images += 1  # Add opening still image
-        total_still_duration = num_still_images * STILL_IMAGE_DURATION
-        calculated_total = total_video_duration + total_still_duration
-    
-    # Verify the calculation matches input duration (allow small rounding differences)
-    if abs(calculated_total - duration) > 0.1:
-        print(f"⚠️  Warning: Calculated total ({calculated_total:.1f}s) doesn't match input duration ({duration:.1f}s)")
-        print(f"   Adjusting to match input duration...")
-        # If we're over, we need to reduce still images or videos
-        if calculated_total > duration:
-            # Reduce still images first (they're less critical)
-            while calculated_total > duration and num_still_images > 0:
-                num_still_images -= 1
-                total_still_duration = num_still_images * STILL_IMAGE_DURATION
-                calculated_total = total_video_duration + total_still_duration
-            # If still over, reduce video segments
-            while calculated_total > duration and num_videos > 1:
-                num_videos -= 1
-                total_video_duration = num_videos * VIDEO_SEGMENT_DURATION
-                calculated_total = total_video_duration + total_still_duration
-        # If we're under, we can add padding or extend final segment (handled later)
-    
-    # Use fixed segment duration
-    segment_duration = VIDEO_SEGMENT_DURATION
-    
-    print(f"Duration: {duration:.1f}s | Video segments: {num_videos} × {VIDEO_SEGMENT_DURATION}s = {total_video_duration:.1f}s | Still images: {num_still_images} × {STILL_IMAGE_DURATION}s = {total_still_duration:.1f}s | Total: {calculated_total:.1f}s")
+    print(f"Duration: {duration}s | Total segments: {num_segments} | Video segments: {num_videos} | Still images: {num_still_images}")
     
     # Step 0: Generate overarching script from video prompt (AI call)
     generated_script = None
     generated_segment_texts = []
     generated_video_prompts = []
     reference_image_info = None  # Initialize reference image info
+    narration_audio_path = None  # Will be set in Step 0.1 (narration generation - MUST happen before video generation)
+    original_voiceover_backup = None  # Will be set in Step 0.1 (narration generation)
     
     print("Step 0: Loading or generating overarching script...")
     # CRITICAL: If any API call fails before Sora 2 video generation, exit the program
@@ -4871,13 +5515,105 @@ def generate_and_upload_sora(
         print(generated_script)
         print("=" * 60)
         
-        # Step 0.5: Rule-based segmentation of the script
-        print(f"Step 0.5: Segmenting script into {num_videos} segments...")
+        # CRITICAL: Step 0.1 - Generate and save narration FIRST (before any video generation)
+        # The assumption is that narration exists when video generation workflow begins
+        print("\n" + "="*60)
+        print("Step 0.1: Generating and saving narration (MUST complete before video generation)...")
+        print("="*60 + "\n")
         
-        generated_segment_texts = segment_script_rule_based(
-            script=generated_script,
-            num_segments=num_videos
-        )
+        narration_audio_path = None
+        original_voiceover_backup = None
+        
+        # Try to load narration from file first
+        narration_file = load_narration_from_file()
+        
+        if narration_file and os.path.exists(narration_file):
+            narration_audio_path = narration_file
+            print(f"✅ Loaded existing narration from file: {narration_file}")
+            # Try to find the original voiceover backup (without music) if it exists
+            backup_path = narration_file.replace('.mp3', '_original.mp3')
+            if os.path.exists(backup_path):
+                original_voiceover_backup = backup_path
+                print(f"✅ Found original voiceover backup: {backup_path}")
+        elif not skip_narration:
+            # Generate narration now - this is the FINAL narration that will be used throughout
+            try:
+                # Use the standard narration path (not a temp file)
+                current_dir = os.getcwd()
+                narration_audio_path = os.path.join(current_dir, NARRATION_AUDIO_PATH)
+                
+                print(f"🎙️  Generating narration audio from script...")
+                narration_audio_path, original_voiceover_backup = generate_voiceover_from_folder(
+                    script=generated_script,
+                    output_path=narration_audio_path,
+                    narration_folder=None,
+                    break_duration=1000,  # 1 second for breaks
+                    music_volume=0.07  # 7% volume for background music
+                )
+                print(f"✅ Narration generated and saved: {narration_audio_path}")
+                if original_voiceover_backup:
+                    print(f"✅ Original voiceover backup saved: {original_voiceover_backup}")
+            except Exception as e:
+                print(f"❌ CRITICAL ERROR: Narration generation failed: {e}")
+                print("   Cannot proceed without narration. Exiting...")
+                import sys
+                sys.exit(1)
+        else:
+            # skip_narration is True - but we still need narration for segmentation
+            # Generate it temporarily, but it won't be the final version
+            try:
+                import tempfile
+                temp_dir = tempfile.gettempdir()
+                timestamp = int(time.time())
+                narration_audio_path = os.path.join(temp_dir, f"voiceover_segmentation_{timestamp}.mp3")
+                
+                print(f"⚠️  skip_narration=True, generating temporary narration for segmentation only...")
+                narration_audio_path, _ = generate_voiceover_from_folder(
+                    script=generated_script,
+                    output_path=narration_audio_path,
+                    narration_folder=None,
+                    break_duration=1000,
+                    music_volume=0.07
+                )
+                print(f"✅ Generated temporary narration for segmentation: {narration_audio_path}")
+                print(f"   Note: Narration will be regenerated in Step 3")
+            except Exception as e:
+                print(f"⚠️  Failed to generate temporary narration for segmentation: {e}")
+                print("   Falling back to rule-based segmentation...")
+                narration_audio_path = None
+        
+        # Step 0.5: Segment script based on narration timing (or fallback to rule-based)
+        print(f"\nStep 0.5: Segmenting script into {num_segments} segments...")
+        
+        if narration_audio_path and os.path.exists(narration_audio_path):
+            print("   Using narration-based segmentation (12-second segments)...")
+            # CRITICAL: This extracts segments from the ACTUAL NARRATION AUDIO using Whisper timestamps
+            # The segments contain words that were actually spoken, not the original script text
+            # These narration-based segments will be used for both video and image generation
+            generated_segment_texts = segment_script_by_narration(
+                script=generated_script,
+                audio_path=narration_audio_path,
+                segment_duration=segment_duration,
+                api_key=api_key,
+                expected_num_segments=num_segments  # Pass expected number to limit segments
+            )
+            # Ensure we have the correct number of segments
+            if len(generated_segment_texts) != num_segments:
+                print(f"⚠️  Narration-based segmentation produced {len(generated_segment_texts)} segments, expected {num_segments}")
+                print("   Adjusting to match expected segment count...")
+                if len(generated_segment_texts) < num_segments:
+                    # Pad with empty segments or repeat last segment
+                    while len(generated_segment_texts) < num_segments:
+                        generated_segment_texts.append(generated_segment_texts[-1] if generated_segment_texts else "")
+                else:
+                    # Truncate to expected number
+                    generated_segment_texts = generated_segment_texts[:num_segments]
+        else:
+            print("   Using rule-based segmentation (word count)...")
+            generated_segment_texts = segment_script_rule_based(
+                script=generated_script,
+                num_segments=num_segments
+            )
         
         # Step 0.52: Generate tags from script and combine with user-provided tags
         if generated_script:
@@ -4922,51 +5658,81 @@ def generate_and_upload_sora(
                 print(f"⚠️  Failed to generate tags from script: {e}")
                 print("   Using only user-provided tags..." if tags else "   Continuing without tags...")
         
-        # Step 0.55: Analyze script for reference image (character or subject)
+        # Step 0.55: Analyze script for reference images (set of reference images needed)
         print("\n" + "="*60)
         print("Step 0.55: Analyzing script for reference image requirements...")
         
+        reference_images = []
         if generated_script:
-            reference_image_info = analyze_script_for_reference_image(
+            reference_images = analyze_script_for_reference_images(
                 script=generated_script,
                 video_prompt=prompt,
                 api_key=api_key,
                 model='gpt-5-2025-08-07'
             )
+            if len(reference_images) > 0:
+                print(f"✅ Identified {len(reference_images)} reference image(s) needed:")
+                for ref_img in reference_images:
+                    ref_id = ref_img.get('id', 'unknown')
+                    ref_desc = ref_img.get('description', '')
+                    ref_type = ref_img.get('type', 'subject')
+                    print(f"   - {ref_id}: {ref_desc} (type: {ref_type})")
+            else:
+                print(f"⚠️  No reference images identified for this video.")
+                print(f"   This may be normal if the video doesn't require visual consistency (e.g., generic topics, abstract concepts)")
+                print(f"   All video segments will be generated without reference images.")
         
-        # Step 0.65: Analyze script for still image opportunities (MUST be before Sora prompt generation)
+        # Step 0.65: Analyze script for still image opportunities and segment assignments (MUST be before Sora prompt generation)
         print("\n" + "="*60)
-        print("Step 0.65: Analyzing script for still image opportunities...")
+        print("Step 0.65: Analyzing script for still image opportunities and segment assignments...")
         print("="*60 + "\n")
         
         still_image_segments = []
+        segment_assignments = []
         try:
-            # Pass the calculated number of still images to ensure alignment with duration
-            still_image_segments = analyze_script_for_still_images(
+            # Debug: Check if reference images are being passed
+            if reference_images and len(reference_images) > 0:
+                print(f"   Passing {len(reference_images)} reference image(s) to segment assignment analysis:")
+                for ref_img in reference_images:
+                    print(f"      - {ref_img.get('id', 'unknown')}: {ref_img.get('description', '')}")
+            else:
+                print(f"   ⚠️  No reference images to pass - all segments will be assigned 'no ref'")
+            
+            # Pass the calculated number of still images and reference images
+            # CRITICAL: generated_segment_texts contains NARRATION-BASED segments (words actually spoken)
+            # These narration segments are used to generate both still image and video prompts
+            analysis_result = analyze_script_for_still_images(
                 script=generated_script,
-                segment_texts=generated_segment_texts,
-                segment_duration=segment_duration,
-                total_duration=duration,
-                target_num_stills=num_still_images,  # Pass calculated number to ensure alignment
+                segment_texts=generated_segment_texts,  # NARRATION-BASED segments (from actual audio)
+                target_num_stills=num_still_images,  # Pass calculated number (approximately 1/3 of segments)
                 api_key=api_key,
                 model='gpt-5-2025-08-07',  # Match Sora prompt model
-                test=test,
-                reference_image_info=reference_image_info  # Pass reference image for consistency
+                reference_images=reference_images  # Pass list of reference images
             )
+            
+            still_image_segments = analysis_result.get('still_image_segments', [])
+            segment_assignments = analysis_result.get('segment_assignments', [])
             
             if still_image_segments:
                 print(f"✅ Identified {len(still_image_segments)} still image position(s)")
                 for seg_info in still_image_segments:
                     seg_id = seg_info.get('segment_id', 'unknown')
-                    if seg_id == 0:
-                        print(f"   - Opening still image (12s)")
-                    else:
-                        print(f"   - Still image after video segment {seg_id} (12s)")
+                    print(f"   - Still image at segment {seg_id} (12s)")
+            
+            if segment_assignments:
+                print(f"✅ Segment assignments:")
+                for assignment in segment_assignments:
+                    seg_id = assignment.get('segment_id', 'unknown')
+                    seg_type = assignment.get('type', 'video')
+                    ref_id = assignment.get('reference_image_id')
+                    ref_str = f" (ref: {ref_id})" if ref_id else " (no ref)"
+                    print(f"   - Segment {seg_id}: {seg_type}{ref_str}")
             else:
-                print("   No still images identified")
+                print("   No segment assignments identified")
         except Exception as e:
             print(f"⚠️  Still image analysis failed: {e}")
             still_image_segments = []
+            segment_assignments = []
         
         # Step 0.6: Convert each segment text to Sora-2 video prompt (AI call per segment)
         # Now that we know where still images will be placed, we can calculate correct timing
@@ -4974,12 +5740,16 @@ def generate_and_upload_sora(
         print(f"Step 0.6: Converting segment texts to Sora-2 video prompts...")
         print("="*60 + "\n")
         
+        # Note: We no longer pass reference_image_info here since we handle multiple reference images
+        # per segment at the video generation level based on segment_assignments
+        # CRITICAL: generated_segment_texts contains NARRATION-BASED segments (words actually spoken in audio)
+        # These narration segments are used to generate Sora video prompts, ensuring videos match what's being narrated
         generated_video_prompts = generate_sora_prompts_from_segments(
-            segment_texts=generated_segment_texts,
+            segment_texts=generated_segment_texts,  # NARRATION-BASED segments (from actual audio)
             segment_duration=segment_duration,
             total_duration=duration,
             overarching_script=generated_script,  # Pass full script for context and chronological flow
-            reference_image_info=reference_image_info,  # Pass reference image info for context
+            reference_image_info=None,  # No longer using single reference image - handled per segment
             still_image_segments=still_image_segments,  # Pass still image positions for correct timing
             api_key=api_key,
             model='gpt-5-2025-08-07'
@@ -4997,78 +5767,125 @@ def generate_and_upload_sora(
         import sys
         sys.exit(1)
     
-    # Step 0.7: Load or generate voiceover with music from the overarching script
-    # SKIP if skip_narration is True (narration will be generated in Step 3)
+    # Step 0.7: Use the narration that was already generated in Step 0.1
+    # CRITICAL: Narration was already generated and saved in Step 0.1 (before video generation)
+    # At this point, narration_audio_path should already exist from Step 0.1
     voiceover_audio_path = None
     original_voiceover_backup = None
-    if not skip_narration and generated_script:
-        print("Step 0.7: Loading or generating voiceover with background music...")
-        
-        # Try to load narration audio from file first
-        narration_file = load_narration_from_file()
-        
-        if narration_file:
-            voiceover_audio_path = narration_file
+    
+    if not skip_narration:
+        # Narration should already exist from Step 0.1
+        if narration_audio_path and os.path.exists(narration_audio_path):
+            voiceover_audio_path = narration_audio_path
             # Try to find the original voiceover backup (without music) if it exists
-            backup_path = narration_file.replace('.mp3', '_original.mp3')
+            backup_path = narration_audio_path.replace('.mp3', '_original.mp3')
             if os.path.exists(backup_path):
                 original_voiceover_backup = backup_path
+            print(f"✅ Using narration from Step 0.1: {voiceover_audio_path}")
+            if original_voiceover_backup:
+                print(f"✅ Original voiceover backup available: {original_voiceover_backup}")
         else:
-            try:
-                temp_dir = tempfile.gettempdir()
-                timestamp = int(time.time())
-                voiceover_audio_path = os.path.join(temp_dir, f"voiceover_{timestamp}.mp3")
-                
-                voiceover_audio_path, original_voiceover_backup = generate_voiceover_with_music(
-                    script=generated_script,
-                    output_path=voiceover_audio_path,
-                    api_key=api_key,
-                    voice='nova',  # Deep, manly male voice - options: 'alloy' (neutral), 'echo' (male, more British-sounding), 'fable' (male), 'onyx' (deep male), 'nova' (female), 'shimmer' (female)
-                    music_style='cinematic',  # Can be: 'cinematic', 'ambient', 'upbeat', 'calm'
-                    music_volume=0.10,  # 10% volume for background music
-                    duration=duration
-                )
-            except Exception as e:
-                print(f"❌ CRITICAL ERROR: Voiceover generation failed: {e}")
+            # Fallback: try to load from file (shouldn't happen if Step 0.1 worked)
+            print("⚠️  Narration not found from Step 0.1, attempting to load from file...")
+            narration_file = load_narration_from_file()
+            if narration_file and os.path.exists(narration_file):
+                voiceover_audio_path = narration_file
+                backup_path = narration_file.replace('.mp3', '_original.mp3')
+                if os.path.exists(backup_path):
+                    original_voiceover_backup = backup_path
+                print(f"✅ Loaded narration from file: {voiceover_audio_path}")
+            else:
+                print(f"❌ CRITICAL ERROR: Narration should have been generated in Step 0.1")
+                print(f"   Cannot proceed without narration. Exiting...")
                 import sys
                 sys.exit(1)
-    elif skip_narration:
-        print("⏭️  Step 0.7: Skipping narration generation (will be done in Step 3)")
+    else:
+        print("⏭️  Step 0.7: Skipping narration (skip_narration=True)")
+        # Note: If skip_narration is True, narration was generated temporarily in Step 0.1 for segmentation only
+        # It will be regenerated in Step 3 if needed
     
-    # Step 1: Generate master/reference image
-    print("Step 1: Generating master reference image...")
-    master_image_path = None
+    # ============================================================================
+    # VIDEO GENERATION WORKFLOW BEGINS HERE
+    # ============================================================================
+    # CRITICAL ASSUMPTION: Narration has already been generated and saved in Step 0.1
+    # At this point, narration_audio_path should exist and be ready for use
+    # All video generation steps (reference images, still images, Sora videos) 
+    # assume narration already exists
+    # ============================================================================
+    
+    # Step 1: Generate reference images (multiple if needed)
+    print("\n" + "="*60)
+    print("Step 1: Generating reference images...")
+    print("="*60 + "\n")
+    print("📌 NOTE: Narration was already generated in Step 0.1 (before video generation)")
+    if narration_audio_path and os.path.exists(narration_audio_path):
+        print(f"   ✅ Narration ready: {os.path.basename(narration_audio_path)}")
+    else:
+        print(f"   ⚠️  WARNING: Narration path not found, but continuing with video generation...")
+    
+    reference_image_paths = {}  # Map reference_image_id -> file_path
+    master_image_path = None  # Keep for backward compatibility (use first reference image)
+    
     # CRITICAL: If API call fails before Sora 2 video generation, exit the program
     try:
-        # Save reference image to output folder
-        timestamp = int(time.time())
-        master_image_path = os.path.join(output_folder, f"reference_image_{timestamp}.png")
-        
-        # Use analyzed reference image prompt if available, otherwise fall back to description
-        if reference_image_info and reference_image_info.get('image_prompt'):
-            print("✅ Using analyzed reference image prompt (if branch)")
-            image_prompt = reference_image_info['image_prompt']
-            print(f"Using analyzed reference image prompt ({reference_image_info.get('type', 'subject')}):")
-            print(f"  {image_prompt[:200]}...")
-            master_image_path = generate_master_image_from_prompt(
-                image_prompt=image_prompt,
-                output_path=master_image_path,
-                api_key=api_key,
-                resolution=resolution
-            )
+        if reference_images and len(reference_images) > 0:
+            print(f"Generating {len(reference_images)} reference image(s)...")
+            timestamp = int(time.time())
+            
+            for i, ref_img in enumerate(reference_images):
+                ref_id = ref_img.get('id', f'ref_{i+1}')
+                ref_description = ref_img.get('description', '')
+                image_prompt = ref_img.get('image_prompt', '')
+                
+                print(f"\n  Reference image {i+1}/{len(reference_images)}: {ref_id} - {ref_description}")
+                
+                # Generate image path
+                ref_image_path = os.path.join(output_folder, f"reference_image_{ref_id}_{timestamp}.png")
+                
+                # Generate the image
+                if image_prompt:
+                    print(f"    Using AI-generated prompt...")
+                    ref_image_path = generate_master_image_from_prompt(
+                        image_prompt=image_prompt,
+                        output_path=ref_image_path,
+                        api_key=api_key,
+                        resolution=resolution
+                    )
+                else:
+                    print(f"    Using description-based generation...")
+                    ref_image_path = generate_master_image_from_prompt(
+                        description=ref_description,
+                        output_path=ref_image_path,
+                        api_key=api_key,
+                        resolution=resolution
+                    )
+                
+                reference_image_paths[ref_id] = ref_image_path
+                print(f"    ✅ Generated: {ref_image_path}")
+                
+                # Set master_image_path to first reference image for backward compatibility
+                if master_image_path is None:
+                    master_image_path = ref_image_path
         else:
-            print("✅ Using description-based reference image generation (else branch)")
-            # Fallback to description-based generation
-            print(f"Using description-based reference image generation...")
+            # Fallback: generate single reference image from description
+            print("No reference images identified, generating single reference image from description...")
+            timestamp = int(time.time())
+            master_image_path = os.path.join(output_folder, f"reference_image_{timestamp}.png")
             master_image_path = generate_master_image_from_prompt(
                 description=description or prompt,
                 output_path=master_image_path,
                 api_key=api_key,
                 resolution=resolution
             )
-        print(f"✅ Master image generated: {master_image_path}")
+            reference_image_paths['ref_1'] = master_image_path
+            print(f"✅ Master image generated: {master_image_path}")
+        
+        print(f"\n✅ All reference images generated: {len(reference_image_paths)} image(s)")
+        for ref_id, path in reference_image_paths.items():
+            print(f"   {ref_id}: {path}")
+            
     except Exception as e:
-        print(f"❌ CRITICAL ERROR: Master image generation API call failed before Sora 2 video generation: {e}")
+        print(f"❌ CRITICAL ERROR: Reference image generation API call failed before Sora 2 video generation: {e}")
         print("   Exiting program as requested. All API calls must succeed before video generation.")
         import sys
         sys.exit(1)
@@ -5143,9 +5960,8 @@ def generate_and_upload_sora(
     # Step 2: Generate multiple videos with rate limiting
     print(f"Step 2: Generating {num_videos} video segment(s) using Sora 2...")
     
-    # segment_duration was calculated to ensure total video matches input duration
-    # Formula: (num_videos * segment_duration) + total_still_duration = duration
-    adjusted_segment_duration = segment_duration
+    # Each segment is 12 seconds
+    video_segment_duration = 12
     
     # Create set of still image positions (after which video segment)
     still_image_segment_ids = set(seg['segment_id'] for seg in still_image_segments) if still_image_segments else set()
@@ -5174,17 +5990,52 @@ def generate_and_upload_sora(
         # Step 2a: Start all video generation jobs 15 seconds apart (non-blocking)
         print("Step 2a: Starting video generation jobs...")
         
-        for segment_id in range(1, num_videos + 1):
-            segment_prompt = video_prompts_to_use[segment_id - 1]
+        # Create mapping from segment_id to assignment
+        assignment_map = {}
+        if segment_assignments:
+            for assignment in segment_assignments:
+                seg_id = assignment.get('segment_id')
+                assignment_map[seg_id] = assignment
+        
+        # Filter to only video segments (skip still image segments)
+        video_segment_ids = []
+        for seg_id in range(1, num_segments + 1):
+            assignment = assignment_map.get(seg_id, {'type': 'video', 'reference_image_id': None})
+            if assignment.get('type') == 'video':
+                video_segment_ids.append(seg_id)
+        
+        # Adjust num_videos to match actual video segments
+        num_videos = len(video_segment_ids)
+        print(f"Generating {num_videos} video segment(s) (out of {num_segments} total segments)")
+        
+        for video_idx, segment_id in enumerate(video_segment_ids, 1):
+            # Get the prompt for this segment (use segment_id - 1 as index)
+            if segment_id <= len(video_prompts_to_use):
+                segment_prompt = video_prompts_to_use[segment_id - 1]
+            else:
+                segment_prompt = video_prompts_to_use[-1] if video_prompts_to_use else prompt
             
             # Validate prompt is not empty
             if not segment_prompt or len(segment_prompt.strip()) == 0:
-                if segment_id > 1 and len(video_prompts_to_use) > 0:
-                    segment_prompt = video_prompts_to_use[segment_id - 2] if segment_id > 1 else prompt
-                else:
-                    segment_prompt = prompt
+                segment_prompt = prompt
             
-            print(f"Segment {segment_id}/{num_videos}: {segment_prompt}")
+            # Get assignment for this segment to determine reference image
+            assignment = assignment_map.get(segment_id, {'type': 'video', 'reference_image_id': None})
+            ref_image_id = assignment.get('reference_image_id')
+            
+            # Determine which reference image to use
+            ref_image_to_use = None
+            if ref_image_id and ref_image_id in reference_image_paths:
+                ref_image_to_use = reference_image_paths[ref_image_id]
+                print(f"Segment {segment_id}/{num_segments} (video {video_idx}/{num_videos}): Using reference image {ref_image_id}")
+            elif master_image_path and os.path.exists(master_image_path):
+                # Fallback to master image if no specific reference image assigned
+                ref_image_to_use = master_image_path
+                print(f"Segment {segment_id}/{num_segments} (video {video_idx}/{num_videos}): Using default master image")
+            else:
+                print(f"Segment {segment_id}/{num_segments} (video {video_idx}/{num_videos}): No reference image")
+            
+            print(f"  Prompt: {segment_prompt[:100]}...")
             
             # Create output path for this segment
             base, ext = os.path.splitext(output_video_path)
@@ -5192,11 +6043,7 @@ def generate_and_upload_sora(
             
             # Start video generation job (non-blocking)
             try:
-                ref_image_to_use = None
-                if master_image_path and os.path.exists(master_image_path):
-                    ref_image_to_use = master_image_path
-                
-                video_segment_duration = int(adjusted_segment_duration) if adjusted_segment_duration != segment_duration else int(segment_duration)
+                video_segment_duration = 12
                 
                 video_id = start_video_generation_job(
                     prompt=segment_prompt,
@@ -5253,13 +6100,22 @@ def generate_and_upload_sora(
                     else:
                         # Retry: start a new job
                         print(f"   Retry attempt {attempt}/{max_retries}: Starting new video generation job...")
+                        # Get assignment for this segment to determine reference image for retry
+                        assignment = assignment_map.get(segment_id, {'type': 'video', 'reference_image_id': None})
+                        ref_image_id = assignment.get('reference_image_id')
+                        retry_ref_image = None
+                        if ref_image_id and ref_image_id in reference_image_paths:
+                            retry_ref_image = reference_image_paths[ref_image_id]
+                        elif master_image_path and os.path.exists(master_image_path):
+                            retry_ref_image = master_image_path
+                        
                         retry_video_id = start_video_generation_job(
                             prompt=segment_prompt,
                             api_key=api_key,
                             model=model,
                             resolution=resolution,
-                            duration=int(adjusted_segment_duration),
-                            reference_image_path=master_image_path if master_image_path and os.path.exists(master_image_path) else None
+                            duration=12,
+                            reference_image_path=retry_ref_image
                         )
                         print(f"   New job ID: {retry_video_id}")
                         
@@ -5291,7 +6147,22 @@ def generate_and_upload_sora(
                     error_msg = str(e)
                     error_type = type(e).__name__
                     
-                    if attempt < max_retries:
+                    # Check if this is a moderation_blocked error - don't retry these
+                    is_moderation_blocked = False
+                    if hasattr(e, 'code') and e.code == 'moderation_blocked':
+                        is_moderation_blocked = True
+                    elif 'moderation_blocked' in error_msg.lower():
+                        is_moderation_blocked = True
+                    elif hasattr(e, 'error') and hasattr(e.error, 'code') and e.error.code == 'moderation_blocked':
+                        is_moderation_blocked = True
+                    elif hasattr(e, 'error') and isinstance(e.error, dict) and e.error.get('code') == 'moderation_blocked':
+                        is_moderation_blocked = True
+                    
+                    if is_moderation_blocked:
+                        print(f"   🚫 Moderation blocked error detected - skipping retries and using fallback")
+                        # Break out of retry loop immediately - will use fallback below
+                        break
+                    elif attempt < max_retries:
                         print(f"   ⚠️  Attempt {attempt} failed ({error_type}): {error_msg[:200]}")
                         print(f"   Retrying in 5 seconds...")
                         time.sleep(5)
@@ -5349,7 +6220,7 @@ def generate_and_upload_sora(
                             
                             # Create panning video matching the segment duration (to maintain synchronization)
                             # Use the same duration as the video segment would have been
-                            fallback_video_duration = int(adjusted_segment_duration) if adjusted_segment_duration else int(segment_duration)
+                            fallback_video_duration = 12
                             fallback_video_path = create_panning_video_from_image(
                                 image_path=fallback_image_path,
                                 output_path=fallback_video_path,
@@ -5381,7 +6252,7 @@ def generate_and_upload_sora(
                 raise RuntimeError(f"Segment {segment_id} failed: {last_error}")
         
         # Step 2.1: Stitch all video segments together (including still image panning videos)
-        # Pattern: V1, V2, V3, Still(12s), V4, V5, V6, Still(12s), V7, V8, V9, Still(12s), ...
+        # Use segment_assignments to determine order: videos and still images in sequence
         all_segment_paths = []
         
         # Create a mapping of segment_id -> video_path for Sora videos
@@ -5389,32 +6260,37 @@ def generate_and_upload_sora(
         for seg_info in generated_video_segments:
             sora_video_map[seg_info['segment_id']] = seg_info['video_path']
         
-        # Create a mapping of position -> still image video path
+        # Create a mapping of segment_id -> still image video path
         still_image_map = {}
-        opening_still_path = None
-        for seg_info in still_image_segments:
-            position = seg_info['segment_id']  # Position: 0 = opening, or after which video (e.g., 3 = after video 3)
-            if position == 0:
-                # Opening still image (test mode)
-                if 0 in still_image_videos:
-                    opening_still_path = still_image_videos[0]
-            else:
-                if position in still_image_videos:
-                    still_image_map[position] = still_image_videos[position]
+        for seg_id, still_path in still_image_videos.items():
+            still_image_map[seg_id] = still_path
         
-        # If test mode, add opening still image first
-        if opening_still_path:
-            all_segment_paths.append(opening_still_path)
+        # Create mapping from segment_id to assignment
+        assignment_map = {}
+        if segment_assignments:
+            for assignment in segment_assignments:
+                seg_id = assignment.get('segment_id')
+                assignment_map[seg_id] = assignment
         
-        # Combine in order: for each video segment, add it, then add still image if needed
-        for segment_id in range(1, num_videos + 1):
-            if segment_id in sora_video_map:
-                all_segment_paths.append(sora_video_map[segment_id])
-            else:
-                print(f"⚠️  Warning: No video found for segment {segment_id}")
+        # Combine segments in order based on segment_assignments
+        for segment_id in range(1, num_segments + 1):
+            assignment = assignment_map.get(segment_id, {'type': 'video', 'reference_image_id': None})
+            seg_type = assignment.get('type', 'video')
             
-            if segment_id in still_image_map:
-                all_segment_paths.append(still_image_map[segment_id])
+            if seg_type == 'still':
+                # Add still image
+                if segment_id in still_image_map:
+                    all_segment_paths.append(still_image_map[segment_id])
+                    print(f"  Added still image for segment {segment_id}")
+                else:
+                    print(f"⚠️  Warning: Still image expected for segment {segment_id} but not found")
+            elif seg_type == 'video':
+                # Add video
+                if segment_id in sora_video_map:
+                    all_segment_paths.append(sora_video_map[segment_id])
+                    print(f"  Added video for segment {segment_id}")
+                else:
+                    print(f"⚠️  Warning: Video expected for segment {segment_id} but not found")
         
         if not all_segment_paths:
             raise RuntimeError("No video segments were generated!")
@@ -5447,7 +6323,7 @@ def generate_and_upload_sora(
                     if duration_diff > 0.5:  # More than 0.5s difference
                         print(f"⚠️  Warning: Stitched video duration ({stitched_duration:.1f}s) doesn't match input duration ({duration:.1f}s)")
                         print(f"   Difference: {duration_diff:.1f}s")
-                        print(f"   Expected: {num_videos} video segments × {VIDEO_SEGMENT_DURATION}s + {num_still_images} still images × {STILL_IMAGE_DURATION}s = {calculated_total:.1f}s")
+                        print(f"   Expected: {num_videos} video segments × 12s + {num_still_images} still images × 12s = {duration}s")
                     else:
                         print(f"✅ Stitched video duration matches input: {stitched_duration:.1f}s (target: {duration:.1f}s)")
         elif len(all_segment_paths) == 1:
@@ -5530,17 +6406,82 @@ def generate_and_upload_sora(
                 video_duration = get_media_duration(video_path, ffmpeg_path)
                 
                 if video_duration:
-                    
-                    # Re-mix audio with proper synchronization:
-                    # 1. Extract voiceover from mixed audio (we'll need to regenerate or extract it)
-                    # 2. Sync music to video duration exactly
-                    # 3. Re-mix with voiceover having padding
-                    
-                    # For now, we'll sync the mixed audio and use FFmpeg's audio positioning
-                    # The music portion should align with video, voiceover can have padding
                     import tempfile
                     temp_dir = tempfile.gettempdir()
                     timestamp = int(time.time())
+                    
+                    # CRITICAL: ALWAYS adjust narration duration to match video_duration - 2 seconds
+                    # This must happen BEFORE mixing with music
+                    print(f"\n   📏 Adjusting narration duration to match video...")
+                    print(f"      Video duration: {video_duration:.2f}s")
+                    
+                    # Get original voiceover source (without music)
+                    voiceover_source = None
+                    if original_voiceover_backup and os.path.exists(original_voiceover_backup):
+                        voiceover_source = original_voiceover_backup
+                        print(f"      Using original voiceover from backup")
+                    else:
+                        # Fallback: try to find original voiceover in temp directory
+                        import glob
+                        temp_dir_check = tempfile.gettempdir()
+                        original_pattern = os.path.join(temp_dir_check, "original_voiceover_*.mp3")
+                        original_files = glob.glob(original_pattern)
+                        if original_files:
+                            voiceover_source = max(original_files, key=os.path.getmtime)
+                            print(f"      Using original voiceover from temp directory")
+                        else:
+                            # Final fallback: use mixed audio (will extract narration if possible)
+                            voiceover_source = voiceover_audio_path
+                            print(f"      ⚠️  Using mixed audio as source (original not found)")
+                    
+                    # Adjust narration to exactly video_duration - 2 seconds
+                    target_voiceover_duration = max(1.0, video_duration - 2.0)
+                    voiceover_duration = get_media_duration(voiceover_source, ffmpeg_path)
+                    
+                    narration_was_adjusted = False
+                    adjusted_voiceover_path = None
+                    
+                    if voiceover_duration:
+                        print(f"      Current narration: {voiceover_duration:.2f}s")
+                        print(f"      Target narration: {target_voiceover_duration:.2f}s (video - 2s)")
+                        print(f"      Narration will start 1s after video, end 1s before video")
+                        
+                        if abs(voiceover_duration - target_voiceover_duration) > 0.1:
+                            print(f"      Adjusting narration speed to match target duration...")
+                            adjusted_voiceover_path = os.path.join(temp_dir, f"voiceover_adjusted_{timestamp}.mp3")
+                            
+                            # Use speed adjustment to match exact duration
+                            try:
+                                adjusted_voiceover = adjust_audio_duration(
+                                    audio_path=voiceover_source,
+                                    target_duration=target_voiceover_duration,
+                                    output_path=adjusted_voiceover_path,
+                                    ffmpeg_path=ffmpeg_path,
+                                    method='speed'  # Use speed adjustment to preserve all content
+                                )
+                                
+                                # Verify the adjustment worked
+                                adjusted_duration = get_media_duration(adjusted_voiceover, ffmpeg_path)
+                                if adjusted_duration and abs(adjusted_duration - target_voiceover_duration) < 0.5:
+                                    voiceover_source = adjusted_voiceover
+                                    narration_was_adjusted = True
+                                    print(f"      ✅ Narration adjusted to {adjusted_duration:.2f}s (target: {target_voiceover_duration:.2f}s)")
+                                else:
+                                    print(f"      ⚠️  Speed adjustment may have failed. Adjusted duration: {adjusted_duration:.2f}s, expected: {target_voiceover_duration:.2f}s")
+                                    print(f"      Using original narration")
+                            except Exception as e:
+                                print(f"      ❌ Speed adjustment failed: {e}")
+                                print(f"      Using original narration")
+                        else:
+                            print(f"      ✅ Narration duration already matches target ({target_voiceover_duration:.2f}s)")
+                    else:
+                        print(f"      ⚠️  Could not determine narration duration, using original")
+                    
+                    # Now proceed with music mixing
+                    # Re-mix audio with proper synchronization:
+                    # 1. Narration is already adjusted to video_duration - 2 seconds
+                    # 2. Sync music to video duration exactly
+                    # 3. Re-mix with voiceover having padding
                     
                     # Try to re-extract music from VIDEO_MUSIC.mp3 and sync it
                     current_dir = os.getcwd()
@@ -5561,26 +6502,28 @@ def generate_and_upload_sora(
                             if abs(music_duration - video_duration) > 0.1:
                                 # Adjust music to match video exactly
                                 if music_duration > video_duration:
-                                    # Trim music
+                                    # Trim music with fade in (1s) and fade out (1s)
+                                    fade_out_start = max(0, video_duration - 1.0)
                                     cmd_music = [
                                         ffmpeg_path,
                                         "-i", music_source,
                                         "-t", str(video_duration),
-                                        "-af", f"afade=t=out:st={max(0, video_duration-2)}:d=2",
+                                        "-af", f"afade=t=in:st=0:d=1,afade=t=out:st={fade_out_start}:d=1",  # Fade in 1s, fade out 1s
                                         "-c:a", "libmp3lame",
                                         "-b:a", "192k",
                                         "-y",
                                         synced_music_path
                                     ]
                                 else:
-                                    # Loop music to extend
+                                    # Loop music to extend with fade in (1s) and fade out (1s)
                                     loop_count = int((video_duration / music_duration) + 1)
+                                    fade_out_start = max(0, video_duration - 1.0)
                                     cmd_music = [
                                         ffmpeg_path,
                                         "-stream_loop", str(loop_count - 1),
                                         "-i", music_source,
                                         "-t", str(video_duration),
-                                        "-af", f"afade=t=out:st={max(0, video_duration-2)}:d=2",
+                                        "-af", f"afade=t=in:st=0:d=1,afade=t=out:st={fade_out_start}:d=1",  # Fade in 1s, fade out 1s
                                         "-c:a", "libmp3lame",
                                         "-b:a", "192k",
                                         "-y",
@@ -5591,160 +6534,117 @@ def generate_and_upload_sora(
                                     subprocess.run(cmd_music, capture_output=True, text=True, check=True)
                                     print(f"   ✅ Music synced to video duration: {video_duration:.2f}s")
                                     
-                                    # Try to get original voiceover from temp backup
-                                    voiceover_source = None
-                                    if original_voiceover_backup and os.path.exists(original_voiceover_backup):
-                                        voiceover_source = original_voiceover_backup
-                                        print(f"   Using original voiceover from backup for re-mixing")
-                                    else:
-                                        # Fallback: try to find original voiceover in temp directory
-                                        import glob
-                                        temp_dir_check = tempfile.gettempdir()
-                                        original_pattern = os.path.join(temp_dir_check, "original_voiceover_*.mp3")
-                                        original_files = glob.glob(original_pattern)
-                                        if original_files:
-                                            # Get most recent original voiceover
-                                            voiceover_source = max(original_files, key=os.path.getmtime)
-                                            print(f"   Using original voiceover from temp directory: {os.path.basename(voiceover_source)}")
-                                    
-                                    # Final fallback: use mixed audio (not ideal, but better than nothing)
+                                    # Narration is already adjusted to video_duration - 2 seconds (done above before music sync)
+                                    # Check if we're using mixed audio - if so, don't add music again!
+                                    # IMPORTANT: If narration was speed-adjusted, we should NOT use the mixed audio path
+                                    # Instead, we should mix the adjusted narration with fresh music
                                     using_mixed_audio_as_source = False
-                                    if not voiceover_source or not os.path.exists(voiceover_source):
-                                        voiceover_source = voiceover_audio_path
+                                    if not narration_was_adjusted and voiceover_source == voiceover_audio_path:
                                         using_mixed_audio_as_source = True
-                                        print(f"   ⚠️  Using mixed audio as voiceover source (original not found)")
                                     
-                                    # Adjust voiceover to fit within video bounds (can start at/after video start, end at/before video end)
-                                    voiceover_duration = get_media_duration(voiceover_source, ffmpeg_path)
-                                    if voiceover_duration:
-                                        # Voiceover should be <= video_duration (can be shorter)
-                                        # Narration must be shorter than video by at most 5 seconds
-                                        # It can start at video start or up to voiceover_tolerance seconds after
-                                        # It can end at video end or up to 5 seconds before (for opening/closing shots)
-                                        max_voiceover_duration = video_duration  # Can't be longer than video
-                                        min_voiceover_duration = max(1.0, video_duration - 5.0)  # At most 5 seconds shorter than video
+                                    if using_mixed_audio_as_source:
+                                        # The source already has music mixed in, so just sync it to video duration
+                                        print(f"   ℹ️  Source already contains music - syncing to video without re-adding music")
+                                        synced_audio_path = os.path.join(temp_dir, f"audio_synced_no_remix_{timestamp}.mp3")
                                         
-                                        target_voiceover_duration = min(max_voiceover_duration, max(min_voiceover_duration, voiceover_duration))
-                                        
-                                        if abs(voiceover_duration - target_voiceover_duration) > 0.1:
-                                            print(f"   Adjusting voiceover duration: {voiceover_duration:.2f}s -> {target_voiceover_duration:.2f}s")
-                                            adjusted_voiceover = os.path.join(temp_dir, f"voiceover_adjusted_{timestamp}.mp3")
-                                            
-                                            if voiceover_duration > target_voiceover_duration:
-                                                # Trim voiceover
-                                                cmd_voiceover = [
+                                        # Just trim/extend the mixed audio to match video duration exactly
+                                        audio_duration = get_media_duration(voiceover_source, ffmpeg_path)
+                                        if audio_duration and abs(audio_duration - video_duration) > 0.1:
+                                            if audio_duration > video_duration:
+                                                # Trim to video duration
+                                                cmd_sync = [
                                                     ffmpeg_path,
                                                     "-i", voiceover_source,
-                                                    "-t", str(target_voiceover_duration),
+                                                    "-t", str(video_duration),
                                                     "-c:a", "copy",
                                                     "-y",
-                                                    adjusted_voiceover
+                                                    synced_audio_path
                                                 ]
                                             else:
-                                                # Voiceover is shorter - that's fine, it can start after video start
-                                                # Just copy it
-                                                import shutil
-                                                shutil.copy2(voiceover_source, adjusted_voiceover)
-                                            
+                                                # Extend with silence or loop (simple: just pad with silence)
+                                                cmd_sync = [
+                                                    ffmpeg_path,
+                                                    "-i", voiceover_source,
+                                                    "-af", "apad",
+                                                    "-t", str(video_duration),
+                                                    "-c:a", "libmp3lame",
+                                                    "-b:a", "192k",
+                                                    "-y",
+                                                    synced_audio_path
+                                                ]
                                             try:
-                                                if voiceover_duration > target_voiceover_duration:
-                                                    subprocess.run(cmd_voiceover, capture_output=True, text=True, check=True)
-                                                voiceover_source = adjusted_voiceover
+                                                subprocess.run(cmd_sync, capture_output=True, text=True, check=True)
+                                                voiceover_audio_path = synced_audio_path
+                                                print(f"   ✅ Mixed audio synced to video duration ({video_duration:.2f}s) without doubling music")
                                             except Exception as e:
-                                                print(f"   ⚠️  Voiceover adjustment failed: {e}")
-                                                voiceover_source = voiceover_source  # Use original
-                                        
-                                        # Check if we're using mixed audio - if so, don't add music again!
-                                        if using_mixed_audio_as_source:
-                                            # The source already has music mixed in, so just sync it to video duration
-                                            print(f"   ℹ️  Source already contains music - syncing to video without re-adding music")
-                                            synced_audio_path = os.path.join(temp_dir, f"audio_synced_no_remix_{timestamp}.mp3")
-                                            
-                                            # Just trim/extend the mixed audio to match video duration exactly
-                                            audio_duration = get_media_duration(voiceover_source, ffmpeg_path)
-                                            if audio_duration and abs(audio_duration - video_duration) > 0.1:
-                                                if audio_duration > video_duration:
-                                                    # Trim to video duration
-                                                    cmd_sync = [
-                                                        ffmpeg_path,
-                                                        "-i", voiceover_source,
-                                                        "-t", str(video_duration),
-                                                        "-c:a", "copy",
-                                                        "-y",
-                                                        synced_audio_path
-                                                    ]
-                                                else:
-                                                    # Extend with silence or loop (simple: just pad with silence)
-                                                    cmd_sync = [
-                                                        ffmpeg_path,
-                                                        "-i", voiceover_source,
-                                                        "-af", "apad",
-                                                        "-t", str(video_duration),
-                                                        "-c:a", "libmp3lame",
-                                                        "-b:a", "192k",
-                                                        "-y",
-                                                        synced_audio_path
-                                                    ]
-                                                try:
-                                                    subprocess.run(cmd_sync, capture_output=True, text=True, check=True)
-                                                    voiceover_audio_path = synced_audio_path
-                                                    print(f"   ✅ Mixed audio synced to video duration ({video_duration:.2f}s) without doubling music")
-                                                except Exception as e:
-                                                    print(f"   ⚠️  Audio sync failed: {e}, using original")
-                                                    voiceover_audio_path = voiceover_source
-                                            else:
-                                                # Duration already matches, just use it
+                                                print(f"   ⚠️  Audio sync failed: {e}, using original")
                                                 voiceover_audio_path = voiceover_source
-                                                print(f"   ✅ Mixed audio duration already matches video ({video_duration:.2f}s)")
                                         else:
-                                            # Original voiceover found - safe to add music
-                                            # Now mix: voiceover (within video bounds) + music (synced to video)
-                                            # Music starts at video start (0s), voiceover can start at 0s or up to voiceover_tolerance seconds after
-                                            # Both should end at video_duration
-                                            synced_audio_path = os.path.join(temp_dir, f"audio_resynced_{timestamp}.mp3")
-                                            
-                                            # Calculate voiceover start delay (can be 0 to voiceover_tolerance seconds)
-                                            voiceover_start_delay = 0.0  # Start at video start by default
-                                            if voiceover_duration < video_duration:
-                                                # If voiceover is shorter, we can delay it slightly
-                                                voiceover_start_delay = min(voiceover_tolerance, (video_duration - target_voiceover_duration) / 2)
-                                            
-                                            # Mix: music starts at 0s, voiceover starts at voiceover_start_delay
-                                            # Add volume boost after mixing to prevent quiet audio (amix can reduce overall volume)
-                                            filter_complex = (
-                                                f"[0:a]aresample=44100,volume=1.0,adelay={int(voiceover_start_delay * 1000)}|{int(voiceover_start_delay * 1000)}[voice_delayed];"
-                                                f"[1:a]aresample=44100,volume={0.10}[music];"  # 10% volume for background music
-                                                f"[voice_delayed][music]amix=inputs=2:duration=longest:dropout_transition=2,"
-                                                f"volume=2.0"  # Boost volume by 2x (6dB) after mixing to compensate for amix volume reduction
-                                            )
-                                            
-                                            cmd_remix = [
-                                                ffmpeg_path,
-                                                "-i", voiceover_source,
-                                                "-i", synced_music_path,
-                                                "-filter_complex", filter_complex,
-                                                "-t", str(video_duration),  # Total duration matches video exactly
-                                                "-c:a", "libmp3lame",
-                                                "-b:a", "192k",
-                                                "-ar", "44100",
-                                                "-ac", "2",
-                                                "-y",
-                                                synced_audio_path
-                                            ]
-                                            
-                                            subprocess.run(cmd_remix, capture_output=True, text=True, check=True)
-                                            voiceover_audio_path = synced_audio_path
-                                            print(f"   ✅ Audio re-mixed: music synced to video ({video_duration:.2f}s)")
-                                            if voiceover_start_delay > 0:
-                                                print(f"   ✅ Voiceover starts {voiceover_start_delay:.2f}s after video start")
-                                            if target_voiceover_duration < video_duration:
-                                                print(f"   ✅ Voiceover ends {video_duration - target_voiceover_duration:.2f}s before video end")
+                                            # Duration already matches, just use it
+                                            voiceover_audio_path = voiceover_source
+                                            print(f"   ✅ Mixed audio duration already matches video ({video_duration:.2f}s)")
+                                    else:
+                                        # Original voiceover found - safe to add music
+                                        # Now mix: voiceover (within video bounds) + music (synced to video)
+                                        # Music starts at video start (0s), voiceover can start at 0s or up to voiceover_tolerance seconds after
+                                        # Both should end at video_duration
+                                        synced_audio_path = os.path.join(temp_dir, f"audio_resynced_{timestamp}.mp3")
+                                        
+                                        # Mix music and narration together
+                                        # Delay will be applied when adding to video (in add_audio_to_video function)
+                                        # Narration is already adjusted to video_duration - 2 seconds
+                                        # Add volume boost after mixing to prevent quiet audio (amix can reduce overall volume)
+                                        filter_complex = (
+                                            f"[0:a]aresample=44100,volume=1.0[voice];"  # No delay here - will be applied when adding to video
+                                            f"[1:a]aresample=44100,volume={0.07}[music];"  # 7% volume for background music
+                                            f"[voice][music]amix=inputs=2:duration=longest:dropout_transition=2,"
+                                            f"volume=2.0"  # Boost volume by 2x (6dB) after mixing to compensate for amix volume reduction
+                                        )
+                                        
+                                        cmd_remix = [
+                                            ffmpeg_path,
+                                            "-i", voiceover_source,
+                                            "-i", synced_music_path,
+                                            "-filter_complex", filter_complex,
+                                            "-t", str(video_duration),  # Total duration matches video exactly
+                                            "-c:a", "libmp3lame",
+                                            "-b:a", "192k",
+                                            "-ar", "44100",
+                                            "-ac", "2",
+                                            "-y",
+                                            synced_audio_path
+                                        ]
+                                        
+                                        subprocess.run(cmd_remix, capture_output=True, text=True, check=True)
+                                        voiceover_audio_path = synced_audio_path
+                                        print(f"   ✅ Audio re-mixed: music synced to video ({video_duration:.2f}s)")
+                                        print(f"   ✅ Narration will start 1s after video start (delay applied when adding to video)")
+                                        print(f"   ✅ Narration will end 1s before video end (duration: {target_voiceover_duration:.2f}s)")
                                     
                                 except Exception as e:
                                     print(f"   ⚠️  Music re-sync failed: {e}")
                                     print(f"   Using original mixed audio")
                         else:
-                            print(f"   ✅ Music already matches video duration")
+                            # Music duration matches, but we still need to add fade in/out
+                            print(f"   Music duration matches video, applying fade in/out...")
+                            fade_out_start = max(0, video_duration - 1.0)
+                            faded_music_path = os.path.join(temp_dir, f"music_faded_{timestamp}.mp3")
+                            cmd_fade = [
+                                ffmpeg_path,
+                                "-i", music_source,
+                                "-af", f"afade=t=in:st=0:d=1,afade=t=out:st={fade_out_start}:d=1",  # Fade in 1s, fade out 1s
+                                "-c:a", "libmp3lame",
+                                "-b:a", "192k",
+                                "-y",
+                                faded_music_path
+                            ]
+                            try:
+                                subprocess.run(cmd_fade, capture_output=True, text=True, check=True)
+                                synced_music_path = faded_music_path
+                                print(f"   ✅ Music fade in/out applied")
+                            except Exception as e:
+                                print(f"   ⚠️  Music fade failed: {e}, using original music")
+                                synced_music_path = music_source
                     else:
                         print(f"   ⚠️  Could not determine music duration")
                 else:
@@ -5772,14 +6672,33 @@ def generate_and_upload_sora(
                     print("Step 2.7: Adding subtitles/captions to video...")
                     print("="*60 + "\n")
                     try:
+                        # Check if video already has subtitles - if so, use the original video without subtitles
+                        # FFmpeg subtitles filter will add subtitles on top, so we need a clean video
                         base, ext = os.path.splitext(video_path)
-                        video_with_subtitles_path = f"{base}_with_subtitles{ext}"
+                        if "_with_subtitles" in base:
+                            # Video already has subtitles - find the original video without subtitles
+                            original_base = base.rsplit("_with_subtitles", 1)[0]
+                            original_video_path = f"{original_base}{ext}"
+                            if os.path.exists(original_video_path):
+                                print(f"   Using original video without subtitles: {os.path.basename(original_video_path)}")
+                                video_path_for_subtitles = original_video_path
+                            else:
+                                # Original not found, use current video (will create new one)
+                                video_path_for_subtitles = video_path
+                        else:
+                            video_path_for_subtitles = video_path
+                        
+                        # Create output path (will be handled by add_subtitles_to_video if None)
+                        base_for_output, ext_for_output = os.path.splitext(video_path_for_subtitles)
+                        if "_with_subtitles" in base_for_output:
+                            base_for_output = base_for_output.rsplit("_with_subtitles", 1)[0]
+                        video_with_subtitles_path = f"{base_for_output}_with_subtitles{ext_for_output}"
                         
                         # Use original voiceover backup for accurate word-level timing (pure voiceover, no music)
                         audio_for_subtitles = original_voiceover_backup if original_voiceover_backup and os.path.exists(original_voiceover_backup) else voiceover_audio_path
                         
                         video_with_subtitles = add_subtitles_to_video(
-                            video_path=video_path,
+                            video_path=video_path_for_subtitles,
                             script=generated_script,
                             video_duration=video_duration,
                             output_path=video_with_subtitles_path,
@@ -5932,6 +6851,8 @@ def generate_and_upload_sora(
                 # Move final video to output path in output folder
                 if os.path.exists(output_video_path):
                     os.remove(output_video_path)  # Remove existing file if present
+                # Ensure shutil is available (it's imported at top, but ensure it's accessible)
+                import shutil
                 shutil.move(video_path, output_video_path)
                 video_path = output_video_path
                 print(f"✅ Final video saved to: {output_video_path}")
@@ -6096,6 +7017,8 @@ def generate_and_upload_sora(
                     os.makedirs(output_folder, exist_ok=True)
                 if os.path.exists(output_video_path):
                     os.remove(output_video_path)
+                # Ensure shutil is available (it's imported at top, but ensure it's accessible)
+                import shutil
                 shutil.move(video_path, output_video_path)
                 video_path = output_video_path
                 print(f"✅ Final video saved to: {output_video_path}")
@@ -6545,6 +7468,13 @@ Environment Variables:
                 step1_input = 'n'
         
         if step1_input in ['y', 'yes']:
+            # Archive workflow files before starting new script generation
+            # This ensures narration_audio.mp3 and other files from previous run are saved
+            print("\n" + "="*60)
+            print("📦 Archiving previous workflow files...")
+            print("="*60)
+            archive_workflow_files()
+            print("="*60 + "\n")
             # Always ask for all configuration inputs and save to config
             # Delete existing config file at the start (cleanup from last run)
             if os.path.exists(CONFIG_FILE_PATH):
@@ -6747,18 +7677,47 @@ Environment Variables:
                 traceback.print_exc()
                 return 1
         
-        # Step 2: Generate video (Sora video generation)
+        # Step 2: Generate narration (generate narration audio)
         print("\n" + "="*60)
-        print("STEP 2: Generate Video")
+        print("STEP 2: Generate Narration")
         print("="*60)
         step2_input = 'n'
         if not args.non_interactive:
             try:
-                step2_input = input("Generate video? (y/n, default: n): ").strip().lower()
+                step2_input = input("Generate narration? (y/n, default: n): ").strip().lower()
             except (EOFError, KeyboardInterrupt):
                 step2_input = 'n'
         
         if step2_input in ['y', 'yes']:
+            try:
+                narration_file = generate_and_save_narration(
+                    script_file_path=SCRIPT_FILE_PATH,
+                    narration_audio_path=NARRATION_AUDIO_PATH,
+                    duration=None,
+                    api_key=args.api_key
+                )
+                print(f"\n✅ STEP 2 COMPLETE: Narration generation complete!")
+                print(f"🎙️  Narration audio saved to: {narration_file}")
+                print(f"\n✅ Script execution complete. Exiting.")
+                return 0
+            except Exception as e:
+                print(f"\n❌ Error generating narration: {e}")
+                import traceback
+                traceback.print_exc()
+                return 1
+        
+        # Step 3: Generate video (Sora video generation)
+        print("\n" + "="*60)
+        print("STEP 3: Generate Video")
+        print("="*60)
+        step3_input = 'n'
+        if not args.non_interactive:
+            try:
+                step3_input = input("Generate video? (y/n, default: n): ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                step3_input = 'n'
+        
+        if step3_input in ['y', 'yes']:
             # Load config and script
             config = load_config()
             if not config:
@@ -6823,35 +7782,6 @@ Environment Variables:
                 traceback.print_exc()
                 return 1
         
-        # Step 3: Generate narration (generate narration audio)
-        print("\n" + "="*60)
-        print("STEP 3: Generate Narration")
-        print("="*60)
-        step3_input = 'n'
-        if not args.non_interactive:
-            try:
-                step3_input = input("Generate narration audio? (y/n, default: n): ").strip().lower()
-            except (EOFError, KeyboardInterrupt):
-                step3_input = 'n'
-        
-        if step3_input in ['y', 'yes']:
-            try:
-                narration_file = generate_and_save_narration(
-                    script_file_path=SCRIPT_FILE_PATH,
-                    narration_audio_path=NARRATION_AUDIO_PATH,
-                    duration=None,
-                    api_key=args.api_key
-                )
-                print(f"\n✅ STEP 3 COMPLETE: Narration generation complete!")
-                print(f"🎙️  Narration audio saved to: {narration_file}")
-                print(f"\n✅ Script execution complete. Exiting.")
-                return 0
-            except Exception as e:
-                print(f"\n❌ Error generating narration: {e}")
-                import traceback
-                traceback.print_exc()
-                return 1
-        
         # Step 4: Add captions based on narration
         print("\n" + "="*60)
         print("STEP 4: Add Captions Based on Narration")
@@ -6859,7 +7789,7 @@ Environment Variables:
         step4_input = 'n'
         if not args.non_interactive:
             try:
-                step4_input = input("Add captions based on narration? (y/n, default: n): ").strip().lower()
+                step4_input = input("Generate captions/subtitles? (y/n, default: n): ").strip().lower()
             except (EOFError, KeyboardInterrupt):
                 step4_input = 'n'
         

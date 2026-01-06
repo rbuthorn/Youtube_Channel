@@ -5,6 +5,7 @@ Uploads videos to YouTube using the YouTube Data API v3 with configurable parame
 
 import os
 import argparse
+import tempfile
 from datetime import datetime, timedelta
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -12,6 +13,14 @@ from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 import pickle
+
+try:
+    from PIL import Image
+    PIL_AVAILABLE = True
+except ImportError:
+    PIL_AVAILABLE = False
+    print("Warning: PIL/Pillow not installed. Thumbnail optimization will be limited.")
+    print("Install with: pip install Pillow")
 
 
 # YouTube API scopes
@@ -106,6 +115,160 @@ def get_authenticated_service(client_secrets_file='client_secrets.json'):
     return build(API_SERVICE_NAME, API_VERSION, credentials=creds)
 
 
+def optimize_thumbnail_for_youtube(thumbnail_file, max_size_mb=2, target_size=(1280, 720)):
+    """
+    Optimize thumbnail image for YouTube upload.
+    
+    YouTube requirements:
+    - Maximum file size: 2MB
+    - Recommended dimensions: 1280x720 pixels (16:9 aspect ratio)
+    - Minimum width: 640 pixels
+    - Maximum width: 1280 pixels
+    - Formats: JPG, GIF (non-animated), BMP, or PNG
+    
+    Args:
+        thumbnail_file: Path to the thumbnail image file
+        max_size_mb: Maximum file size in MB (default: 2MB)
+        target_size: Target dimensions as (width, height) tuple (default: 1280x720)
+        
+    Returns:
+        Path to optimized thumbnail file (may be same file if no optimization needed,
+        or a new temp file if optimization was required)
+    """
+    if not os.path.exists(thumbnail_file):
+        raise FileNotFoundError(f"Thumbnail file not found: {thumbnail_file}")
+    
+    # Check file size
+    file_size_mb = os.path.getsize(thumbnail_file) / (1024 * 1024)
+    
+    if not PIL_AVAILABLE:
+        # Without PIL, we can only check file size
+        if file_size_mb > max_size_mb:
+            raise ValueError(
+                f"Thumbnail file is too large: {file_size_mb:.2f}MB (max: {max_size_mb}MB). "
+                f"Please resize/compress the image manually or install Pillow: pip install Pillow"
+            )
+        return thumbnail_file
+    
+    # Get image dimensions
+    try:
+        with Image.open(thumbnail_file) as img:
+            original_size = img.size
+            original_format = img.format
+    except Exception as e:
+        raise ValueError(f"Could not open thumbnail image: {e}")
+    
+    # Check if optimization is needed
+    needs_resize = original_size != target_size
+    needs_compress = file_size_mb > max_size_mb
+    
+    # If no optimization needed, return original
+    if not needs_resize and not needs_compress:
+        print(f"✅ Thumbnail is already optimized: {original_size[0]}x{original_size[1]}, {file_size_mb:.2f}MB")
+        return thumbnail_file
+    
+    print(f"🔄 Optimizing thumbnail...")
+    print(f"   Original: {original_size[0]}x{original_size[1]}, {file_size_mb:.2f}MB")
+    
+    # Create optimized version
+    try:
+        with Image.open(thumbnail_file) as img:
+            # Convert RGBA to RGB if needed (for JPG compatibility)
+            if img.mode in ('RGBA', 'LA', 'P'):
+                # Create white background for transparent images
+                rgb_img = Image.new('RGB', img.size, (255, 255, 255))
+                if img.mode == 'P':
+                    img = img.convert('RGBA')
+                rgb_img.paste(img, mask=img.split()[-1] if img.mode == 'RGBA' else None)
+                img = rgb_img
+            elif img.mode != 'RGB':
+                img = img.convert('RGB')
+            
+            # Resize to target dimensions (maintain aspect ratio, then crop if needed)
+            # Use LANCZOS resampling (high quality), fallback to ANTIALIAS for older PIL versions
+            try:
+                resample = Image.Resampling.LANCZOS
+            except AttributeError:
+                resample = Image.LANCZOS
+            img.thumbnail(target_size, resample)
+            
+            # If image is smaller than target, create a new image with target size and paste centered
+            if img.size[0] < target_size[0] or img.size[1] < target_size[1]:
+                # Create new image with target size and black background
+                new_img = Image.new('RGB', target_size, (0, 0, 0))
+                # Calculate position to center the image
+                x_offset = (target_size[0] - img.size[0]) // 2
+                y_offset = (target_size[1] - img.size[1]) // 2
+                new_img.paste(img, (x_offset, y_offset))
+                img = new_img
+            else:
+                # Crop to exact target size (center crop)
+                left = (img.size[0] - target_size[0]) // 2
+                top = (img.size[1] - target_size[1]) // 2
+                right = left + target_size[0]
+                bottom = top + target_size[1]
+                img = img.crop((left, top, right, bottom))
+            
+            # Save to temp file with compression
+            temp_dir = tempfile.gettempdir()
+            temp_thumbnail = os.path.join(temp_dir, f"youtube_thumbnail_{os.path.basename(thumbnail_file)}")
+            
+            # Try different quality levels to get under 2MB
+            quality = 95
+            max_size_bytes = max_size_mb * 1024 * 1024
+            
+            while quality >= 50:
+                img.save(temp_thumbnail, 'JPEG', quality=quality, optimize=True)
+                temp_size = os.path.getsize(temp_thumbnail)
+                
+                if temp_size <= max_size_bytes:
+                    print(f"   ✅ Optimized: {img.size[0]}x{img.size[1]}, {temp_size / (1024 * 1024):.2f}MB (quality: {quality})")
+                    return temp_thumbnail
+                
+                quality -= 5
+            
+            # Check final size after loop (shouldn't happen, but just in case)
+            final_check_size = os.path.getsize(temp_thumbnail)
+            if final_check_size <= max_size_bytes:
+                print(f"   ✅ Optimized: {img.size[0]}x{img.size[1]}, {final_check_size / (1024 * 1024):.2f}MB (quality: 50)")
+                return temp_thumbnail
+            
+            # If still too large, try more aggressive compression
+            if final_check_size > max_size_bytes:
+                # Resize smaller and try again
+                smaller_size = (int(target_size[0] * 0.9), int(target_size[1] * 0.9))
+                try:
+                    resample = Image.Resampling.LANCZOS
+                except AttributeError:
+                    resample = Image.LANCZOS
+                img.thumbnail(smaller_size, resample)
+                
+                # Create new image with target size
+                new_img = Image.new('RGB', target_size, (0, 0, 0))
+                x_offset = (target_size[0] - img.size[0]) // 2
+                y_offset = (target_size[1] - img.size[1]) // 2
+                new_img.paste(img, (x_offset, y_offset))
+                img = new_img
+                
+                img.save(temp_thumbnail, 'JPEG', quality=85, optimize=True)
+                final_size = os.path.getsize(temp_thumbnail)
+                
+                if final_size <= max_size_bytes:
+                    print(f"   ✅ Optimized: {img.size[0]}x{img.size[1]}, {final_size / (1024 * 1024):.2f}MB")
+                    return temp_thumbnail
+                else:
+                    raise ValueError(
+                        f"Could not compress thumbnail below {max_size_mb}MB. "
+                        f"Final size: {final_size / (1024 * 1024):.2f}MB. "
+                        f"Please manually compress the image."
+                    )
+            
+            return temp_thumbnail
+            
+    except Exception as e:
+        raise ValueError(f"Failed to optimize thumbnail: {e}")
+
+
 def upload_video(
     video_file,
     title,
@@ -198,13 +361,26 @@ def upload_video(
     # Upload thumbnail if provided
     if thumbnail_file and os.path.exists(thumbnail_file):
         try:
+            # Optimize thumbnail for YouTube before uploading
+            print("🖼️  Optimizing thumbnail for YouTube...")
+            optimized_thumbnail = optimize_thumbnail_for_youtube(thumbnail_file)
+            
             youtube.thumbnails().set(
                 videoId=video_id,
-                media_body=MediaFileUpload(thumbnail_file)
+                media_body=MediaFileUpload(optimized_thumbnail)
             ).execute()
-            print(f"Thumbnail uploaded successfully!")
+            print(f"✅ Thumbnail uploaded successfully!")
+            
+            # Clean up temp file if it was created
+            if optimized_thumbnail != thumbnail_file and os.path.exists(optimized_thumbnail):
+                try:
+                    os.remove(optimized_thumbnail)
+                except:
+                    pass
         except Exception as e:
-            print(f"Warning: Failed to upload thumbnail: {e}")
+            print(f"⚠️  Warning: Failed to upload thumbnail: {e}")
+            import traceback
+            traceback.print_exc()
     
     # Add to playlist if provided
     if playlist_id:

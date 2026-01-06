@@ -29,6 +29,26 @@ credentials.json
 .DS_Store
 Thumbs.db
 
+# Output files and media
+video_output/
+narration_segments/
+*.mp3
+*.mp4
+*.png
+*.jpg
+*.jpeg
+*.wav
+*.avi
+*.mov
+
+# Keep template files
+!client_secrets_template.json
+!config_example.py
+
+
+
+
+
 
 
 

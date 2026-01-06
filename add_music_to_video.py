@@ -302,10 +302,10 @@ def add_narration_music_and_captions_to_video(video_path, output_path=None, api_
                                     if voiceover_duration < video_duration:
                                         voiceover_start_delay = min(voiceover_tolerance, (video_duration - target_voiceover_duration) / 2)
                                     
-                                    # Mix: music starts at 0s, voiceover starts at voiceover_start_delay
+                                    # Mix music and narration together (delay will be applied when adding to video)
                                     filter_complex = (
                                         f"[0:a]aresample=44100,volume=1.0,adelay={int(voiceover_start_delay * 1000)}|{int(voiceover_start_delay * 1000)}[voice_delayed];"
-                                        f"[1:a]aresample=44100,volume={0.15}[music];"
+                                        f"[1:a]aresample=44100,volume={0.07}[music];"
                                         f"[voice_delayed][music]amix=inputs=2:duration=longest:dropout_transition=2,"
                                         f"volume=2.0"
                                     )
