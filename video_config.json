@@ -1,14 +1,14 @@
 {
-  "prompt": "a fun entertaining documentary style video about the dinosaurs and their lifetime on earth",
-  "title": "dinos",
-  "description": "dinos",
-  "duration": 24,
+  "prompt": "the story of amelia earharts trip. what really happened? are there any interesting theories on how she went down or if she landed?",
+  "title": "Amelia Earhart Didn't Just Crash - She Vanished",
+  "description": "Amelia Earhart didn’t just crash—she vanished, leaving behind one of the greatest unsolved mysteries in aviation and world history, and this video breaks down exactly what we know, what went wrong, and what may have happened next. From her final radio transmissions over the Pacific, the desperate search for Howland Island, and the limits of 1930s navigation technology, to the haunting theories involving Nikumaroro Island, lost distress signals, and vanished remains, this documentary separates verified facts from speculation to explore how America’s most famous aviator disappeared without a trace. Perfect for fans of historical mysteries, unsolved disappearances, aviation history, and true history documentaries, this episode dives deep into the evidence, the myths, and the unanswered questions surrounding Amelia Earhart’s final flight.#AmeliaEarhart #UnsolvedMysteries #AviationHistory #HistoricalMysteries",
+  "duration": 360,
   "tags": null,
-  "privacy_status": "private",
-  "category_id": "22",
-  "model": "sora-2",
+  "privacy_status": "public",
+  "category_id": "27",
+  "model": "sora-2-pro",
   "resolution": "1280x720",
-  "thumbnail_file": "C:\\Users\\Robert Buthorn\\Documents\\Youtube_Channel\\thumbnail_file.png",
+  "thumbnail_file": "C:\\Users\\Robert Buthorn\\Documents\\Youtube_Channel\\thumbnail_file.jpg",
   "playlist_id": null,
-  "test_mode": true
+  "test_mode": false
 }

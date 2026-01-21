@@ -1,22 +1,40 @@
-# Python
+# Sensitive credentials and tokens
+client_secrets.json
+token.pickle
+*.pickle
+
+# API keys and secrets
+*.key
+*.secret
+.env
+.env.local
+
+# Python cache
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
-env/
-venv/
-ENV/
-.venv
 
-# YouTube API
-token.pickle
-client_secrets.json
-credentials.json
+# Generated files and outputs
+video_output/
+narration_segments/
+*.mp3
+*.mp4
+*.wav
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.srt
+*.vtt
 
-# Environment variables
-.env
-.env.local
+# Scripts and configs (keep examples)
+overarching_script.txt
+narration_audio.mp3
+VIDEO_MUSIC.mp3
+thumbnail_file.jpg
+cozy fireplace.jpg
 
 # IDE
 .vscode/
@@ -29,38 +47,9 @@ credentials.json
 .DS_Store
 Thumbs.db
 
-# Output files and media
-video_output/
-narration_segments/
-*.mp3
-*.mp4
-*.png
-*.jpg
-*.jpeg
-*.wav
-*.avi
-*.mov
+# Backup files
+*.bak
+*.backup
 
-# Keep template files
-!client_secrets_template.json
-!config_example.py
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+# Logs
+*.log

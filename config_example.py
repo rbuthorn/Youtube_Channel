@@ -7,7 +7,7 @@ Copy this file to config.py and update with your values.
 CLIENT_SECRETS_FILE = 'client_secrets.json'  # OAuth 2.0 client secrets JSON file
 
 # Default video settings
-DEFAULT_CATEGORY_ID = '22'  # People & Blogs
+DEFAULT_CATEGORY_ID = '27'  # People & Blogs
 DEFAULT_PRIVACY_STATUS = 'private'  # Options: 'private', 'public', 'unlisted'
 
 # Common YouTube Category IDs
