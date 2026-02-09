@@ -1,3 +1,4 @@
+
 """
 Complete Workflow: Generate video using OpenAI Sora 2 and upload to YouTube
 Combines Sora 2 video generation and YouTube upload in one script.
