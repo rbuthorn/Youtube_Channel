@@ -48,7 +48,8 @@ This channel leverages artificial intelligence to create video content programma
    - Download the credentials JSON file and save it as `client_secrets.json`
 
 3. **First-time authentication:**
-   - Run the upload script - it will open a browser for OAuth authentication
+   - Run `python generate_and_upload_sora.py` and choose the upload step
+   - The OAuth flow opens a browser on first upload
    - Authorize the application and credentials will be saved to `token.pickle`
 
 ## Usage
@@ -88,52 +89,9 @@ $env:OPENAI_API_KEY="your-api-key-here"
 export OPENAI_API_KEY="your-api-key-here"
 ```
 
-See [SORA_SETUP.md](SORA_SETUP.md) for detailed setup instructions.
-
 ### Upload Existing Video
 
-Upload a video with all parameters:
-
-```bash
-python upload_video.py path/to/video.mp4 \
-  --title "My Video Title" \
-  --description "Video description here" \
-  --tags "tag1" "tag2" "tag3" \
-  --privacy public \
-  --category 22 \
-  --thumbnail path/to/thumbnail.jpg \
-  --playlist PLAYLIST_ID
-```
-
-### Parameters
-
-- `video_file` (required): Path to the video file to upload
-- `--title` (required): Video title
-- `--description`: Video description (default: empty)
-- `--tags`: Space-separated list of tags
-- `--category`: YouTube category ID (default: 22 - People & Blogs)
-- `--privacy`: Privacy status - `private`, `public`, or `unlisted` (default: private)
-- `--thumbnail`: Path to thumbnail image file (optional)
-- `--playlist`: YouTube playlist ID to add video to (optional)
-
-### Python Code Example
-
-```python
-from upload_video import upload_video
-
-video_id = upload_video(
-    video_file='my_video.mp4',
-    title='My Awesome Video',
-    description='This is a description of my video',
-    tags=['ai', 'automation', 'youtube'],
-    category_id='22',
-    privacy_status='public',
-    thumbnail_file='thumbnail.jpg',
-    playlist_id='PLxxxxxxx'
-)
-
-print(f"Uploaded video ID: {video_id}")
-```
+Use the interactive workflow in `generate_and_upload_sora.py` and run only the upload step.
 
 ### Python Code Example
 
@@ -159,7 +117,7 @@ video_id = generate_and_upload_sora(
 - **Cloud-based**: No local model download needed, runs on OpenAI servers
 - **Text-to-Video**: Generates videos directly from text prompts
 - **Pricing**: Pay-per-use based on video length and resolution
-- **Setup**: See [SORA_SETUP.md](SORA_SETUP.md) for detailed instructions
+- **Setup**: Configure `OPENAI_API_KEY` and run the main script
 
 ---
 
