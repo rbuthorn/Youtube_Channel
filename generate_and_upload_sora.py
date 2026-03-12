@@ -55,6 +55,8 @@ SORA_ALLOWED_SIZES = {"720x1280", "1280x720", "1024x1792", "1792x1024"}
 SORA_ALLOWED_SECONDS = {"12"}
 FIXED_SEGMENT_DURATION_SECONDS = 12.0
 FIXED_SEGMENT_DURATION_INT = int(FIXED_SEGMENT_DURATION_SECONDS)
+# Text model for generating Sora segment prompts.
+SORA_PROMPT_TEXT_MODEL = "gpt-4o"
 
 # ElevenLabs API configuration
 # Set ELEVENLABS_API_KEY via environment variable or command-line argument --elevenlabs-api-key
@@ -141,6 +143,7 @@ def generate_visual_continuity_description(script, video_prompt, api_key=None, m
     analysis_prompt = f"""Analyze this video script and produce a DETAILED VISUAL CONTINUITY DESCRIPTION.
 This text will be prepended to every segment prompt so all segments maintain consistent
 style, environment cues, and story-world details.
+NON-NEGOTIABLE: every segment must look indistinguishable from real-life camera footage.
 
 Video topic: {video_prompt}
 
@@ -150,7 +153,7 @@ Script:
 YOUR TASK: Write one dense paragraph that locks continuity for things and events, not people:
 
 1. Prioritize places, objects, events, era details, weather, architecture, materials, and motion cues.
-2. Include stable cinematic style controls: lens behavior, camera movement tempo, lighting, color palette, grain, realism level.
+2. Include stable documentary camera controls: lens behavior, camera movement tempo, lighting, color palette, grain, and hard realism lock.
 3. Include recurring motifs/props/setting markers that should persist across segments.
 4. Avoid named people, facial attributes, outfits, or any person-identity continuity requirements.
 5. Write as direct descriptive prose, not meta instructions.
@@ -158,6 +161,7 @@ YOUR TASK: Write one dense paragraph that locks continuity for things and events
 CRITICAL CONSTRAINTS:
 - Description should be 700-1000 characters.
 - Keep it high-information and reusable for every segment.
+- Reinforce real-world photorealism so every segment reads as genuine live-action footage.
 
 Provide ONLY the visual description paragraph (no labels, no quotes, no explanation):"""
     
@@ -165,7 +169,7 @@ Provide ONLY the visual description paragraph (no labels, no quotes, no explanat
         response = client.responses.create(
             model=model,
             input=[
-                {"role": "system", "content": "You are a visual design expert for documentary-style AI video generation. You produce precise event/object-centric continuity anchors and avoid person-specific identity constraints."},
+                {"role": "system", "content": "You are a visual design expert for documentary-style AI video generation. You produce precise event/object-centric continuity anchors, avoid person-specific identity constraints, and enforce strict photorealism so every segment looks like real-life footage (never CGI/stylized)."},
                 {"role": "user", "content": analysis_prompt}
             ],
             max_output_tokens=2000
@@ -510,6 +514,8 @@ SCRIPT_FILE_PATH = "overarching_script.txt"
 NARRATION_AUDIO_PATH = "narration_audio.mp3"
 # Config file path constant
 CONFIG_FILE_PATH = "video_config.json"
+# Default background music mix level (20% louder than prior 8% baseline)
+DEFAULT_MUSIC_VOLUME = 0.096
 
 def archive_workflow_files():
     """
@@ -963,14 +969,14 @@ def generate_and_save_narration(script_file_path=None, narration_audio_path=None
                 api_key=api_key,
                 max_attempts=3,
                 tolerance_seconds=60,
-                music_volume=0.08
+                music_volume=DEFAULT_MUSIC_VOLUME
             )
         else:
             # No target duration - generate narration without duration adjustment
             voiceover_audio_path, voiceover_only_source = generate_voiceover_with_elevenlabs(
                 script=script,
                 output_path=narration_audio_path,
-                music_volume=0.08
+                music_volume=DEFAULT_MUSIC_VOLUME
             )
 
         # Generate background music using the final narration duration (not requested video duration).
@@ -1023,7 +1029,7 @@ def generate_and_save_narration(script_file_path=None, narration_audio_path=None
             voiceover_audio_path=mix_source,
             music_audio_path=music_file_path,
             output_path=narration_audio_path,
-            music_volume=0.08
+            music_volume=DEFAULT_MUSIC_VOLUME
         )
         print(f"✅ Narration remixed with music: {narration_audio_path}")
         
@@ -1141,37 +1147,108 @@ CURRENT SCRIPT:
 
 OUTPUT THE ADJUSTED SCRIPT ONLY:"""
 
+    def _direction_is_valid(original_len, candidate_len):
+        if direction == "SHORTER":
+            return candidate_len < original_len
+        return candidate_len > original_len
+
+    def _select_best_directional_candidate(candidates):
+        valid = [c for c in candidates if c and _direction_is_valid(current_chars, len(c))]
+        if not valid:
+            return None
+        if direction == "SHORTER":
+            return min(valid, key=len)
+        return max(valid, key=len)
+
+    def _trim_script_to_char_limit(source_script, char_limit):
+        if not source_script:
+            return source_script
+        normalized = re.sub(r"\s+", " ", source_script).strip()
+        if len(normalized) <= char_limit:
+            return normalized
+        sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", normalized) if s.strip()]
+        selected = []
+        running_len = 0
+        for sentence in sentences:
+            extra = len(sentence) if not selected else len(sentence) + 1
+            if running_len + extra > char_limit:
+                break
+            selected.append(sentence)
+            running_len += extra
+        if selected:
+            candidate = " ".join(selected).strip()
+            if len(candidate) >= 100:
+                return candidate
+        hard_trim = normalized[:char_limit].strip()
+        if " " in hard_trim:
+            hard_trim = hard_trim.rsplit(" ", 1)[0].strip()
+        return hard_trim
+
     try:
         print(f"📝 Adjusting script to be {direction} (target: ~{target_chars} chars, currently: {current_chars} chars)...")
-        
-        response = client.responses.create(
-            model=model,
-            input=[
-                {"role": "system", "content": f"Expert documentary scriptwriter. Your #1 rule: the central theme must remain the dominant focus when adjusting length. Make scripts {direction.lower()} by prioritizing theme-relevant content. When cutting, remove what's furthest from the theme. When expanding, deepen the theme with vivid details, not tangential filler. Preserve this exact arc order: intro, build-up, climax, build-down, conclusion. Ensure build-down follows climax before conclusion. Keep rhythm varied and cinematic, avoid staccato short fragments, and keep transitions smooth. Output ONLY the script text. ALL numbers spelled out. No dashes. No bracketed tags or stage directions."},
-                {"role": "user", "content": adjustment_prompt}
-            ],
-            max_output_tokens=20000
-        )
-        
-        adjusted_script = response.output_text.strip()
-        
-        if not adjusted_script or len(adjusted_script) < 100:
-            print(f"⚠️  GPT returned a very short/empty response, keeping original script")
-            return script
-        
-        # Clean dashes from adjusted script
-        adjusted_script = clean_script_dashes(adjusted_script)
-        # Ensure adjusted script still follows required five-part narrative arc.
-        adjusted_script = enforce_story_arc_structure(
-            script=adjusted_script,
-            video_prompt=video_prompt,
-            api_key=api_key,
-            model='gpt-5-2025-08-07'
-        )
-        
-        print(f"✅ Script adjusted: {current_chars} → {len(adjusted_script)} chars ({len(adjusted_script) - current_chars:+d})")
-        return adjusted_script
-        
+
+        max_retries = 3
+        for retry_idx in range(1, max_retries + 1):
+            retry_suffix = ""
+            if retry_idx > 1:
+                retry_suffix = (
+                    f"\n\nCRITICAL DIRECTION LOCK (retry {retry_idx}/{max_retries}): "
+                    f"Output length must be strictly {direction.lower()} than {current_chars} characters."
+                )
+
+            response = client.responses.create(
+                model=model,
+                input=[
+                    {"role": "system", "content": f"Expert documentary scriptwriter. Your #1 rule: the central theme must remain the dominant focus when adjusting length. Make scripts {direction.lower()} by prioritizing theme-relevant content. When cutting, remove what's furthest from the theme. When expanding, deepen the theme with vivid details, not tangential filler. Preserve this exact arc order: intro, build-up, climax, build-down, conclusion. Ensure build-down follows climax before conclusion. Keep rhythm varied and cinematic, avoid staccato short fragments, and keep transitions smooth. Output ONLY the script text. ALL numbers spelled out. No dashes. No bracketed tags or stage directions."},
+                    {"role": "user", "content": adjustment_prompt + retry_suffix}
+                ],
+                max_output_tokens=20000
+            )
+
+            raw_adjusted_script = (response.output_text or "").strip()
+            if not raw_adjusted_script or len(raw_adjusted_script) < 100:
+                print("⚠️  GPT returned a very short/empty response, retrying...")
+                continue
+
+            # Candidate before arc pass.
+            direct_candidate = clean_script_dashes(raw_adjusted_script)
+            # Candidate after arc pass (can change length significantly).
+            arc_candidate = enforce_story_arc_structure(
+                script=direct_candidate,
+                video_prompt=video_prompt,
+                api_key=api_key,
+                model='gpt-5-2025-08-07'
+            )
+
+            chosen_candidate = _select_best_directional_candidate([arc_candidate, direct_candidate])
+            if chosen_candidate:
+                print(
+                    f"✅ Script adjusted ({direction}): {current_chars} → {len(chosen_candidate)} chars "
+                    f"({len(chosen_candidate) - current_chars:+d})"
+                )
+                return chosen_candidate
+
+            print(
+                f"⚠️  Direction check failed on retry {retry_idx}/{max_retries} "
+                f"(wanted {direction}, got {len(direct_candidate)} and {len(arc_candidate) if arc_candidate else 0} chars)."
+            )
+
+        # Safety fallback after retries:
+        # - For SHORTER: deterministic trim so we never accidentally grow when we must shrink.
+        # - For LONGER: keep original rather than returning an incorrectly shorter script.
+        if direction == "SHORTER":
+            safe_target = max(300, min(target_chars, current_chars - 1))
+            trimmed = clean_script_dashes(_trim_script_to_char_limit(script, safe_target))
+            if trimmed and len(trimmed) < current_chars:
+                print(
+                    f"⚠️  Using deterministic shortening fallback: {current_chars} → {len(trimmed)} chars "
+                    f"({len(trimmed) - current_chars:+d})"
+                )
+                return trimmed
+
+        print("⚠️  Could not produce a directionally valid adjustment. Keeping original script.")
+        return script
+
     except Exception as e:
         print(f"⚠️  Failed to adjust script: {e}")
         print("   Keeping original script...")
@@ -1186,7 +1263,7 @@ def generate_narration_with_duration_loop(
     api_key=None,
     max_attempts=3,
     tolerance_seconds=60,
-    music_volume=0.08):
+    music_volume=DEFAULT_MUSIC_VOLUME):
     """
     Generate narration from script using ElevenLabs TTS, then iteratively adjust the script
     length until the narration duration is within tolerance of the target duration.
@@ -1206,7 +1283,7 @@ def generate_narration_with_duration_loop(
         api_key: OpenAI API key (for GPT script adjustment)
         max_attempts: Maximum number of generate-check-adjust cycles (default: 3)
         tolerance_seconds: Max seconds the narration may exceed the target (default: 60). Narration must be >= target.
-        music_volume: Background music volume (default: 0.08)
+        music_volume: Background music volume (default: DEFAULT_MUSIC_VOLUME)
         
     Returns:
         Tuple of (narration_audio_path, voiceover_only_path, final_script)
@@ -1375,7 +1452,7 @@ def generate_script_from_prompt(video_prompt, duration=12, api_key=None, model='
     # Calculate target character count: 750 characters per minute of video
     # Convert duration from seconds to minutes
     duration_minutes = duration / 60.0
-    target_characters = int(duration_minutes * 750)
+    target_characters = int(duration_minutes * 600)
     
     script_prompt = f"""Write a {duration}-second documentary-style YouTube narration script (~{target_characters} characters) about: {video_prompt}
 
@@ -1706,9 +1783,9 @@ def enforce_strict_video_prompt_constraints(
     prompt = re.sub(r"\n{3,}", "\n\n", prompt).strip()
 
     realism_anchor = (
-        "Ultra-realistic, lifelike live-action documentary footage. "
-        "Natural lighting, physically plausible motion, authentic materials/textures, and real camera optics. "
-        "No CGI look, no animation, no stylization."
+        "ABSOLUTE REALISM LOCK: footage must look indistinguishable from real-life live-action documentary video captured in the physical world. "
+        "Use natural lighting, physically plausible motion, authentic materials/textures, real camera optics, natural depth-of-field, and subtle real-world imperfections. "
+        "No CGI look, no animation, no stylization, and no synthetic render aesthetic."
     )
     adherence_anchor = (
         f"Strict narration lock for this {segment_duration:.1f}s segment: "
@@ -1804,7 +1881,7 @@ def convert_segment_to_video_prompt(
     previous_prompt=None,
     next_segment_text=None,
     api_key=None,
-    model='gpt-5-2025-08-07',
+    model=SORA_PROMPT_TEXT_MODEL,
     max_tokens=20000,
     total_segments=None,
     visual_continuity_description=None,
@@ -1907,7 +1984,7 @@ def convert_segment_to_video_prompt(
         min_shot_duration = segment_duration * 0.4
         requirements_parts.append(f"Max 1 cut, each shot ≥{min_shot_duration:.1f}s (preferably {segment_duration/2:.1f}s each)")
     
-    requirements_parts.append("PHOTOREALISTIC documentary-style (real-life footage, natural lighting, authentic)")
+    requirements_parts.append("ABSOLUTE REALISM LOCK: every frame must look like real-life live-action documentary footage, never CGI or stylized")
     requirements_parts.append("No diagrams/words, no music/sound descriptions, just the scene")
     requirements_parts.append("Include camera movement, angle, lighting, mood")
     
@@ -2028,7 +2105,7 @@ PRIMARY FOCUS - NARRATION FOR THIS SEGMENT:
 "{segment_text}"
 
 NON-NEGOTIABLE GOALS:
-1. EXTREME REALISM: Output must read as ultra-realistic, lifelike live-action documentary footage.
+1. ABSOLUTE REALISM LOCK: Every frame must read as real-life live-action documentary footage captured by a physical camera, no CGI, no stylized look, no synthetic render aesthetic.
 2. STRICT ADHERENCE: Follow the narration for this segment as the source of truth. Do not invent conflicting events.
 3. NARRATION ALIGNMENT: The main visible subjects/actions in this clip must be driven by this segment's narration.
 4. SHOT DISCIPLINE: Use one clear camera setup and one primary action beat (or two only if explicitly warranted).
@@ -2047,7 +2124,7 @@ Requirements:
 
 OUTPUT FORMAT:
 {"1. Start with the EXACT visual continuity description above (copy it verbatim)" if visual_continuity_description else ""}
-{"2. Follow" if visual_continuity_description else "1. Write"} with a cinematographer-style shot brief: framing, camera move, subject action beats, lighting, palette, and realism cues
+{"2. Follow" if visual_continuity_description else "1. Write"} with a cinematographer-style shot brief: framing, camera move, subject action beats, lighting, palette, and explicit real-life footage realism cues
 {"3." if visual_continuity_description else "2."} Explicitly tie visible actions/subjects to the narration content above
 {"4." if visual_continuity_description else "3."} Keep total output concise (target <= 4000 characters)
 {"5." if visual_continuity_description else "4."} No labels, no explanations — provide ONLY the video prompt text
@@ -2066,8 +2143,9 @@ Provide ONLY the video prompt:"""
             # Build strict system prompt for realism and prompt adherence.
             system_prompt = (
                 "You are an expert Sora 2 prompt writer for documentary clips. "
-                "Your prompt must be ultra-realistic and lifelike, with physically plausible motion, natural lighting, "
-                "and authentic textures/materials. "
+                "Your prompt must enforce an absolute realism lock: every frame must look like real-life live-action footage captured by a physical camera, "
+                "with physically plausible motion, natural lighting, and authentic textures/materials. "
+                "Never output a CGI, animated, stylized, or synthetic render aesthetic. "
                 "The segment narration is the source of truth: strictly align visuals to it and avoid conflicting invented events. "
                 "Any provided ordered narration beats are mandatory and must appear on-screen in sequence. "
                 "Use concrete cinematography language (shot framing, camera movement, visible subject action beats, lighting/palette). "
@@ -2117,9 +2195,9 @@ Provide ONLY the video prompt:"""
                 else:
                     # Last attempt failed - use fallback
                     if segment_text and len(segment_text.strip()) > 0:
-                        video_prompt = f"Photorealistic documentary-style video scene matching the narration, as if filmed by a professional camera with natural lighting and realistic textures: {segment_text[:300]}"
+                        video_prompt = f"Ultra-photorealistic real-life documentary footage scene matching the narration, captured by a physical camera with natural lighting, authentic textures, and physically plausible motion, absolutely no CGI or stylization: {segment_text[:300]}"
                     else:
-                        video_prompt = f"Photorealistic documentary-style video scene for segment {segment_id}, as if filmed by a professional camera with natural lighting and realistic textures"
+                        video_prompt = f"Ultra-photorealistic real-life documentary footage scene for segment {segment_id}, captured by a physical camera with natural lighting, authentic textures, and physically plausible motion, absolutely no CGI or stylization"
                     video_prompt = enforce_strict_video_prompt_constraints(
                         video_prompt=video_prompt,
                         segment_text=segment_text,
@@ -2157,9 +2235,9 @@ Provide ONLY the video prompt:"""
             else:
                 # All retries exhausted - use fallback
                 if segment_text and len(segment_text.strip()) > 0:
-                    video_prompt = f"Photorealistic documentary-style video scene matching the narration, as if filmed by a professional camera with natural lighting and realistic textures: {segment_text[:300]}"
+                    video_prompt = f"Ultra-photorealistic real-life documentary footage scene matching the narration, captured by a physical camera with natural lighting, authentic textures, and physically plausible motion, absolutely no CGI or stylization: {segment_text[:300]}"
                 else:
-                    video_prompt = f"Photorealistic documentary-style video scene for segment {segment_id}, as if filmed by a professional camera with natural lighting and realistic textures"
+                    video_prompt = f"Ultra-photorealistic real-life documentary footage scene for segment {segment_id}, captured by a physical camera with natural lighting, authentic textures, and physically plausible motion, absolutely no CGI or stylization"
                 video_prompt = enforce_strict_video_prompt_constraints(
                     video_prompt=video_prompt,
                     segment_text=segment_text,
@@ -2173,9 +2251,9 @@ Provide ONLY the video prompt:"""
     
     # Should never reach here, but just in case
     if segment_text and len(segment_text.strip()) > 0:
-        return f"Photorealistic documentary-style video scene matching the narration, as if filmed by a professional camera with natural lighting and realistic textures: {segment_text[:300]}"
+        return f"Ultra-photorealistic real-life documentary footage scene matching the narration, captured by a physical camera with natural lighting, authentic textures, and physically plausible motion, absolutely no CGI or stylization: {segment_text[:300]}"
     else:
-        return f"Photorealistic documentary-style video scene for segment {segment_id}, as if filmed by a professional camera with natural lighting and realistic textures"
+        return f"Ultra-photorealistic real-life documentary footage scene for segment {segment_id}, captured by a physical camera with natural lighting, authentic textures, and physically plausible motion, absolutely no CGI or stylization"
 
 
 def generate_video_prompts_from_segments(
@@ -2184,7 +2262,7 @@ def generate_video_prompts_from_segments(
     total_duration,
     overarching_script=None,
     api_key=None,
-    model='gpt-5-2025-08-07',
+    model=SORA_PROMPT_TEXT_MODEL,
     max_tokens=20000,
     visual_continuity_description=None,
     narration_offset=0.0
@@ -2277,11 +2355,11 @@ def generate_video_prompts_from_segments(
             if not video_prompt or len(video_prompt.strip()) == 0:
                 # This should not happen due to retry logic, but if it does, use fallback
                 if segment_text and len(segment_text.strip()) > 0:
-                    video_prompt = f"Photorealistic documentary-style video scene matching the narration, as if filmed by a professional camera with natural lighting and realistic textures: {segment_text[:300]}"
+                    video_prompt = f"Ultra-photorealistic real-life documentary footage scene matching the narration, captured by a physical camera with natural lighting, authentic textures, and physically plausible motion, absolutely no CGI or stylization: {segment_text[:300]}"
                 elif overarching_script and len(overarching_script.strip()) > 0:
-                    video_prompt = f"Photorealistic documentary-style video scene, as if filmed by a professional camera with natural lighting and realistic textures: {overarching_script[:300]}"
+                    video_prompt = f"Ultra-photorealistic real-life documentary footage scene captured by a physical camera with natural lighting, authentic textures, and physically plausible motion, absolutely no CGI or stylization: {overarching_script[:300]}"
                 else:
-                    video_prompt = f"Photorealistic documentary-style video scene for segment {i}, as if filmed by a professional camera with natural lighting and realistic textures"
+                    video_prompt = f"Ultra-photorealistic real-life documentary footage scene for segment {i}, captured by a physical camera with natural lighting, authentic textures, and physically plausible motion, absolutely no CGI or stylization"
                 video_prompt = enforce_strict_video_prompt_constraints(
                     video_prompt=video_prompt,
                     segment_text=segment_text,
@@ -2295,13 +2373,13 @@ def generate_video_prompts_from_segments(
             print(f"  ⚠️  Segment {i} failed: {e}")
             # Fallback: use a generic prompt based on the segment text
             if segment_text and len(segment_text.strip()) > 0:
-                fallback_prompt = f"Photorealistic documentary-style video scene matching the narration, as if filmed by a professional camera with natural lighting and realistic textures: {segment_text[:300]}"
+                fallback_prompt = f"Ultra-photorealistic real-life documentary footage scene matching the narration, captured by a physical camera with natural lighting, authentic textures, and physically plausible motion, absolutely no CGI or stylization: {segment_text[:300]}"
             else:
                 # If segment text is also empty, use the overarching script or original prompt
                 if overarching_script and len(overarching_script.strip()) > 0:
-                    fallback_prompt = f"Photorealistic documentary-style video scene, as if filmed by a professional camera with natural lighting and realistic textures: {overarching_script[:300]}"
+                    fallback_prompt = f"Ultra-photorealistic real-life documentary footage scene captured by a physical camera with natural lighting, authentic textures, and physically plausible motion, absolutely no CGI or stylization: {overarching_script[:300]}"
                 else:
-                    fallback_prompt = f"Photorealistic documentary-style video scene for segment {i}, as if filmed by a professional camera with natural lighting and realistic textures"
+                    fallback_prompt = f"Ultra-photorealistic real-life documentary footage scene for segment {i}, captured by a physical camera with natural lighting, authentic textures, and physically plausible motion, absolutely no CGI or stylization"
             fallback_prompt = enforce_strict_video_prompt_constraints(
                 video_prompt=fallback_prompt,
                 segment_text=segment_text,
@@ -2346,7 +2424,7 @@ def mix_voiceover_with_background_music(
     voiceover_audio_path,
     music_audio_path,
     output_path=None,
-    music_volume=0.08,
+    music_volume=DEFAULT_MUSIC_VOLUME,
     ffmpeg_path=None
 ):
     """
@@ -2497,64 +2575,48 @@ def normalize_audio_duration_exact(
     return output_audio_path
 
 
-def infer_video_vibe(video_prompt, script=None):
+def generate_music_prompt(video_prompt, script=None, api_key=None, model='gpt-5-2025-08-07'):
     """
-    Infer a short vibe label from topic/script for music prompt conditioning.
+    Generate a concise, script-aware documentary music prompt.
     """
-    context = f"{video_prompt or ''} {script or ''}".lower()
+    script_excerpt = ""
+    if script:
+        try:
+            script_excerpt = re.sub(r"\s+", " ", str(script)).strip()[:350]
+        except Exception:
+            script_excerpt = str(script)[:350]
 
-    if any(k in context for k in ["war", "battle", "conflict", "genocide", "tragedy", "disaster"]):
-        return "somber and reflective"
-    if any(k in context for k in ["space", "cosmos", "galaxy", "astronomy", "nasa", "planet"]):
-        return "awe-filled and contemplative"
-    if any(k in context for k in ["ocean", "sea", "reef", "forest", "wildlife", "nature", "amazon"]):
-        return "organic and serene"
-    if any(k in context for k in ["egypt", "arab", "middle east", "persia", "ottoman"]):
-        return "ancient and mysterious"
-    if any(k in context for k in ["japan", "china", "korea", "asia", "samurai", "dynasty"]):
-        return "elegant and restrained"
-    if any(k in context for k in ["medieval", "rome", "greece", "viking", "renaissance"]):
-        return "historical and dignified"
-    if any(k in context for k in ["technology", "ai", "computer", "cyber", "future", "robot"]):
-        return "modern and focused"
-    return "calm and curious"
-
-
-def generate_music_prompt(video_prompt, script=None, api_key=None, model='gpt-5-2025-08-07', video_vibe=None):
-    """
-    Generate a concise, vibe-aligned documentary music prompt.
-    """
-    video_vibe = (video_vibe or infer_video_vibe(video_prompt, script)).strip()
-
-    def _build_documentary_fallback_music_prompt(topic, vibe_label):
+    def _build_documentary_fallback_music_prompt(topic, excerpt):
+        excerpt_part = f" Script context: {excerpt}" if excerpt else ""
         return (
-            f"{vibe_label} documentary underscore for {topic[:140]}; "
-            "instrumental, slow steady pulse, subtle dynamics, seamless, no vocals or dramatic hits."
+            f"Documentary underscore for {topic[:140]}; "
+            "slow and steady pulse, intriguing and captivating mood, passionate emotional tone, "
+            "instrumental only, subtle dynamics, seamless, no vocals or dramatic hits."
+            f"{excerpt_part}"
         )
 
     key = api_key or OPENAI_API_KEY or os.getenv('OPENAI_API_KEY')
     if not key:
         print("⚠️  No OpenAI API key available for music prompt generation. Using default prompt.")
-        return _build_documentary_fallback_music_prompt(video_prompt, video_vibe)
+        return _build_documentary_fallback_music_prompt(video_prompt, script_excerpt)
 
     try:
         client = OpenAI(api_key=key)
 
         system_prompt = """You are an expert documentary music director.
-Write ONE simple and concise music prompt.
+Write ONE simple and concise music prompt that relies on the provided script excerpt.
 
 Hard requirements:
-- Use this vibe phrase exactly: {VIBE}
 - Documentary background only (underscore under narration)
-- Instrumental only, slow steady pulse, subtle dynamics
-- Follow topic geography/era mood with 1-2 fitting instruments
+- Must be slow and steady while still intriguing, captivating, and passionate
+- Reflect the story beats in the script excerpt
+- Include 1-2 fitting instruments
 - No vocals, no dramatic hits, no risers, no abrupt transitions
 - Keep it <= 28 words
-- Output only the prompt text""".replace("{VIBE}", video_vibe)
+- Output only the prompt text"""
 
         user_content = f"Video topic: {video_prompt}"
-        if script:
-            script_excerpt = script[:350].strip()
+        if script_excerpt:
             user_content += f"\nScript excerpt: {script_excerpt}"
         user_content += "\nReturn the final prompt now."
 
@@ -2568,13 +2630,12 @@ Hard requirements:
         )
 
         music_prompt = response.output_text.strip().strip('"\'')
-        print(f"🎵 Video vibe: {video_vibe}")
         print(f"🎵 Generated music prompt: {music_prompt}")
         return music_prompt
 
     except Exception as e:
         print(f"⚠️  Failed to generate music prompt via GPT: {e}")
-        return _build_documentary_fallback_music_prompt(video_prompt, video_vibe)
+        return _build_documentary_fallback_music_prompt(video_prompt, script_excerpt)
 
 
 def generate_music_for_narration_step(
@@ -2586,9 +2647,10 @@ def generate_music_for_narration_step(
 ):
     """
     Narration-step music workflow:
-    1) AI generates a vibe-matched prompt
-    2) ElevenLabs generates music
-    3) Audio is normalized and verified to exact video duration
+    1) AI generates a script-aware prompt
+    2) Apply style constraints: slow/steady + intriguing/captivating/passionate
+    3) ElevenLabs generates music
+    4) Audio is normalized and verified to exact video duration
     """
     import tempfile
 
@@ -2598,14 +2660,11 @@ def generate_music_for_narration_step(
     if output_path is None:
         output_path = os.path.join(os.getcwd(), "VIDEO_MUSIC.mp3")
 
-    print("\n🎵 Narration step: generating vibe-matched background music...")
-    video_vibe = infer_video_vibe(video_prompt, script)
-    print(f"🎚️  Detected video vibe: {video_vibe}")
+    print("\n🎵 Narration step: generating script-aware background music...")
     music_prompt = generate_music_prompt(
         video_prompt=video_prompt,
         script=script,
-        api_key=api_key,
-        video_vibe=video_vibe
+        api_key=api_key
     )
 
     temp_dir = tempfile.gettempdir()
@@ -2623,7 +2682,6 @@ def generate_music_for_narration_step(
         music_prompt=music_prompt,
         target_duration_seconds=target_duration_seconds,
         output_path=raw_music_path,
-        video_vibe=video_vibe,
         script_excerpt_for_music=script_excerpt_for_music
     )
     if not generated_path or not os.path.exists(generated_path):
@@ -2665,7 +2723,6 @@ def generate_background_music_with_elevenlabs(
     output_path=None,
     elevenlabs_api_key=None,
     prompt_influence=0.92,
-    video_vibe=None,
     script_excerpt_for_music=None
 ):
     """
@@ -2712,10 +2769,13 @@ def generate_background_music_with_elevenlabs(
     print(f"   Prompt: {music_prompt[:100]}{'...' if len(music_prompt) > 100 else ''}")
     print(f"   Target duration: {target_duration_seconds:.1f}s")
 
-    # Keep the final generation prompt short and strongly conditioned on vibe.
-    resolved_vibe = (video_vibe or "calm and curious").strip()
+    # Step 2: enforce core musical character before sending to ElevenLabs.
+    style_step_two = (
+        "STEP 2 STYLE: keep the music slow and steady, while remaining intriguing, captivating, and passionate. "
+        "Documentary underscore only."
+    )
     enhanced_prompt = (
-        f"{resolved_vibe} documentary underscore. {music_prompt}. "
+        f"{music_prompt}. {style_step_two} "
         "Instrumental only, slow steady pulse, subtle dynamics, seamless, no vocals or dramatic hits."
     )
     if script_excerpt_for_music:
@@ -2975,7 +3035,7 @@ def build_arc_aware_voice_settings(
 def generate_voiceover_with_elevenlabs(
     script,
     output_path=None,
-    music_volume=0.08,
+    music_volume=DEFAULT_MUSIC_VOLUME,
     voice_id=None,
     elevenlabs_api_key=None,
     model_id='eleven_multilingual_v2',
@@ -2991,7 +3051,7 @@ def generate_voiceover_with_elevenlabs(
     Args:
         script: The full narration script text
         output_path: Path to save the final audio file (default: temp file)
-        music_volume: Volume of background music relative to voiceover (0.0-1.0) (default: 0.08, 8%)
+        music_volume: Volume of background music relative to voiceover (0.0-1.0) (default: 0.096, 9.6%)
         voice_id: ElevenLabs voice ID to use (default: uses ELEVENLABS_VOICE_ID global/env var)
         elevenlabs_api_key: ElevenLabs API key (default: uses ELEVENLABS_API_KEY global/env var)
         model_id: ElevenLabs model ID (default: 'eleven_multilingual_v2')
@@ -3951,7 +4011,17 @@ def apply_ending_fade(video_path, output_path=None, ffmpeg_path=None, fade_durat
         return output_path
 
 
-def add_audio_to_video(video_path, audio_path, output_path=None, ffmpeg_path=None, remove_existing_audio=True, sync_duration=True, audio_delay_ms=1000):
+def add_audio_to_video(
+    video_path,
+    audio_path,
+    output_path=None,
+    ffmpeg_path=None,
+    remove_existing_audio=True,
+    sync_duration=True,
+    audio_delay_ms=1000,
+    music_audio_path=None,
+    music_volume=DEFAULT_MUSIC_VOLUME
+):
     """
     Add audio track to a video file using ffmpeg, removing any existing audio.
     Optionally adjusts audio duration to match video duration to prevent cutoff.
@@ -3965,6 +4035,9 @@ def add_audio_to_video(video_path, audio_path, output_path=None, ffmpeg_path=Non
         sync_duration: If True, adjust audio duration to match video (default: True)
         audio_delay_ms: Delay in milliseconds before audio starts (default: 1000ms).
             Used to center narration within the video — set to narration_offset * 1000.
+        music_audio_path: Optional background music file. When provided, music starts at 0s
+            while narration respects audio_delay_ms.
+        music_volume: Background music mix level (default: DEFAULT_MUSIC_VOLUME).
         
     Returns:
         Path to the output video with audio
@@ -4051,30 +4124,50 @@ def add_audio_to_video(video_path, audio_path, output_path=None, ffmpeg_path=Non
         else:
             print("⚠️  Could not determine durations, skipping synchronization")
     
-    # Step 2: Add audio to video with volume boost and narration offset delay
+    # Step 2: Add audio to video.
     # Use ffmpeg to add audio to video
     # Remove any existing audio and replace with new audio track
-    # Apply volume boost to ensure audio is loud enough (compensate for any volume loss during encoding)
-    # Delay audio by audio_delay_ms so narration is centered in the video
+    # Delay narration by audio_delay_ms so it can be centered in the video.
     delay_ms = int(audio_delay_ms)
     print(f"   Audio delay: {delay_ms}ms ({delay_ms / 1000.0:.1f}s)")
     if remove_existing_audio:
-        # Map only video from first input, audio from second input (removes existing audio)
-        # Apply volume boost and narration offset delay
-        cmd = [
-            ffmpeg_path,
-            "-i", video_path,
-            "-i", adjusted_audio_path,
-            "-c:v", "copy",      # Copy video stream without re-encoding
-            "-af", f"volume=1.5,adelay={delay_ms}|{delay_ms}",  # Boost audio by 1.5x and delay by narration offset
-            "-c:a", "aac",       # Encode audio as AAC
-            "-b:a", "192k",      # High quality audio bitrate
-            "-map", "0:v:0",     # Use video from first input (video only, no audio)
-            "-map", "1:a:0",     # Use audio from second input
-            "-shortest",         # Finish encoding when the shortest input stream ends (should match now)
-            "-y",                # Overwrite output
-            output_path
-        ]
+        # Map only video from first input, replace audio with narration (and optional music).
+        if music_audio_path and os.path.exists(music_audio_path):
+            filter_complex = (
+                f"[1:a]aresample=44100,adelay={delay_ms}|{delay_ms},volume=1.0[voice];"
+                f"[2:a]aresample=44100,volume={music_volume}[music];"
+                f"[voice][music]amix=inputs=2:duration=longest:dropout_transition=2,volume=2.0[aout]"
+            )
+            cmd = [
+                ffmpeg_path,
+                "-i", video_path,
+                "-i", adjusted_audio_path,
+                "-i", music_audio_path,
+                "-filter_complex", filter_complex,
+                "-c:v", "copy",      # Copy video stream without re-encoding
+                "-c:a", "aac",       # Encode audio as AAC
+                "-b:a", "192k",      # High quality audio bitrate
+                "-map", "0:v:0",     # Use video from first input (video only, no audio)
+                "-map", "[aout]",    # Use mixed narration+music
+                "-shortest",         # Finish encoding when the shortest input stream ends
+                "-y",                # Overwrite output
+                output_path
+            ]
+        else:
+            cmd = [
+                ffmpeg_path,
+                "-i", video_path,
+                "-i", adjusted_audio_path,
+                "-c:v", "copy",      # Copy video stream without re-encoding
+                "-af", f"volume=1.5,adelay={delay_ms}|{delay_ms}",  # Delay narration by offset
+                "-c:a", "aac",       # Encode audio as AAC
+                "-b:a", "192k",      # High quality audio bitrate
+                "-map", "0:v:0",     # Use video from first input (video only, no audio)
+                "-map", "1:a:0",     # Use audio from second input
+                "-shortest",         # Finish encoding when the shortest input stream ends
+                "-y",                # Overwrite output
+                output_path
+            ]
     else:
         # Keep existing audio and mix (not recommended for our use case)
         # Apply narration offset delay
@@ -4655,6 +4748,13 @@ def wait_for_video_completion(
     print(f"Polling Sora job {video_id} for completion (checking every {poll_interval} seconds)...")
     start_time = time.time()
     last_status = None
+    last_status_change_time = start_time
+    last_heartbeat_time = start_time
+    heartbeat_interval = max(30, min(90, poll_interval * 6))
+    consecutive_not_found = 0
+    consecutive_poll_errors = 0
+    known_active_statuses = {"queued", "in_progress", "processing", "pending", "running", "starting"}
+    known_failure_statuses = {"failed", "cancelled", "canceled", "rejected", "expired"}
     
     while True:
         elapsed_time = time.time() - start_time
@@ -4669,10 +4769,21 @@ def wait_for_video_completion(
             response.raise_for_status()
             video_info = response.json()
             status = (video_info.get("status") or "unknown").lower()
-            
+            consecutive_not_found = 0
+            consecutive_poll_errors = 0
+
             if status != last_status:
                 print(f"  Task {video_id}: Status: {status} (elapsed: {int(elapsed_time)}s)")
                 last_status = status
+                last_status_change_time = time.time()
+                last_heartbeat_time = time.time()
+            elif (time.time() - last_heartbeat_time) >= heartbeat_interval:
+                status_stalled_for = int(time.time() - last_status_change_time)
+                print(
+                    f"  ⏳ Task {video_id} still {status} "
+                    f"(elapsed: {int(elapsed_time)}s, unchanged for {status_stalled_for}s)"
+                )
+                last_heartbeat_time = time.time()
             
             if status == "completed":
                 print(f"  ✅ Task {video_id} completed! Downloading video content...")
@@ -4684,30 +4795,61 @@ def wait_for_video_completion(
                 print(f"  ✅ Video saved (no audio): {output_path}")
                 return output_path
                 
-            elif status == "failed":
-                error_payload = video_info.get("error") or {}
-                error_msg = error_payload.get("message", "Unknown error")
+            elif status in known_failure_statuses:
+                error_payload = video_info.get("error")
+                if isinstance(error_payload, dict):
+                    error_msg = error_payload.get("message") or str(error_payload)
+                elif error_payload:
+                    error_msg = str(error_payload)
+                else:
+                    error_msg = video_info.get("message") or "Unknown error"
 
-                exception_msg = f"Video generation failed for job {video_id}: {error_msg}"
+                exception_msg = f"Video generation failed for job {video_id} (status={status}): {error_msg}"
                 exception = Exception(exception_msg)
                 
                 if any(keyword in error_msg.lower() for keyword in ['content', 'policy', 'moderation', 'blocked', 'sensitive']):
                     exception.code = 'moderation_blocked'
                 
                 raise exception
+            elif status not in known_active_statuses and status != "unknown":
+                # Do not fail immediately on a newly introduced status, but surface it.
+                print(f"  ⚠️  Task {video_id} returned unrecognized status '{status}'. Continuing to poll.")
             
             time.sleep(poll_interval)
             
         except requests.exceptions.RequestException as e:
-            if 'not found' in str(e).lower() or '404' in str(e):
-                print(f"  ⚠️  Warning: Could not retrieve task {video_id} status: {e}")
+            error_text = str(e).lower()
+            if 'not found' in error_text or '404' in error_text:
+                consecutive_not_found += 1
+                print(f"  ⚠️  Warning: Could not retrieve task {video_id} status (not found, {consecutive_not_found}/6): {e}")
+                if consecutive_not_found >= 6:
+                    raise RuntimeError(
+                        f"Sora job {video_id} returned not found for {consecutive_not_found} consecutive polls. "
+                        "The job may have expired or been dropped by the provider."
+                    )
                 time.sleep(poll_interval)
                 continue
             else:
-                raise
+                consecutive_poll_errors += 1
+                if consecutive_poll_errors <= 3:
+                    print(
+                        f"  ⚠️  Transient polling error for task {video_id} "
+                        f"({consecutive_poll_errors}/3): {e}"
+                    )
+                    time.sleep(poll_interval)
+                    continue
+                raise RuntimeError(
+                    f"Failed to poll Sora task {video_id} after {consecutive_poll_errors} consecutive errors: {e}"
+                )
         except Exception as e:
             if 'not found' in str(e).lower():
-                print(f"  ⚠️  Warning: Could not retrieve task {video_id} status: {e}")
+                consecutive_not_found += 1
+                print(f"  ⚠️  Warning: Could not retrieve task {video_id} status (not found, {consecutive_not_found}/6): {e}")
+                if consecutive_not_found >= 6:
+                    raise RuntimeError(
+                        f"Sora job {video_id} returned not found for {consecutive_not_found} consecutive polls. "
+                        "The job may have expired or been dropped by the provider."
+                    )
                 time.sleep(poll_interval)
                 continue
             else:
@@ -4908,6 +5050,19 @@ def load_segment_metadata(output_folder):
     try:
         with open(metadata_path, 'r', encoding='utf-8') as f:
             metadata = json.load(f)
+
+        # JSON object keys are always strings; convert prompt-map keys back to ints
+        # so segment regeneration can reliably match segment IDs.
+        prompt_map = metadata.get('segment_id_to_prompt')
+        if isinstance(prompt_map, dict):
+            normalized_prompt_map = {}
+            for raw_key, prompt_text in prompt_map.items():
+                try:
+                    normalized_prompt_map[int(raw_key)] = prompt_text
+                except (TypeError, ValueError):
+                    normalized_prompt_map[raw_key] = prompt_text
+            metadata['segment_id_to_prompt'] = normalized_prompt_map
+
         print(f"✅ Segment metadata loaded from: {metadata_path}")
         return metadata
     except Exception as e:
@@ -4915,7 +5070,7 @@ def load_segment_metadata(output_folder):
         return None
 
 
-def ensure_audio_on_video(video_path, ffmpeg_path=None, narration_audio_path=None, music_volume=0.08, audio_delay_ms=1000):
+def ensure_audio_on_video(video_path, ffmpeg_path=None, narration_audio_path=None, music_volume=DEFAULT_MUSIC_VOLUME, audio_delay_ms=1000):
     """
     Ensure audio (narration + music) is added to a video file.
     This function automatically finds narration and music files and adds them to the video.
@@ -4924,7 +5079,7 @@ def ensure_audio_on_video(video_path, ffmpeg_path=None, narration_audio_path=Non
         video_path: Path to the video file
         ffmpeg_path: Path to ffmpeg executable (if None, will try to find it)
         narration_audio_path: Path to narration audio (if None, will try to find it)
-        music_volume: Volume level for background music (default: 0.08 = 8%)
+        music_volume: Volume level for background music (default: 0.096 = 9.6%)
         audio_delay_ms: Delay in milliseconds before narration starts (default: 1000ms).
             Used to center narration within the video — set to narration_offset * 1000.
         
@@ -5014,12 +5169,12 @@ def ensure_audio_on_video(video_path, ffmpeg_path=None, narration_audio_path=Non
     temp_dir = tempfile.gettempdir()
     timestamp = int(time.time())
     
-    # Prepare final audio
-    final_audio_path = None
+    # Narration is delayed later; music must start at video t=0.
+    final_audio_path = narration_audio_path
+    music_for_mux_path = None
     
     if music_source:
-        # Mix narration + music
-        print(f"   Mixing narration + music (music at {music_volume*100:.0f}% volume)...")
+        print(f"   Preparing background music at {music_volume*100:.1f}% volume...")
         
         # Sync music to video duration
         synced_music_path = os.path.join(temp_dir, f"music_synced_{timestamp}.mp3")
@@ -5080,40 +5235,13 @@ def ensure_audio_on_video(video_path, ffmpeg_path=None, narration_audio_path=Non
                     synced_music_path = faded_music_path
                 except:
                     synced_music_path = music_source
-        
-        # Mix narration + music
-        final_audio_path = os.path.join(temp_dir, f"audio_mixed_{timestamp}.mp3")
-        filter_complex = (
-            f"[0:a]aresample=44100,volume=1.0[voice];"
-            f"[1:a]aresample=44100,volume={music_volume}[music];"
-            f"[voice][music]amix=inputs=2:duration=longest:dropout_transition=2,"
-            f"volume=2.0"
-        )
-        
-        cmd_mix = [
-            ffmpeg_path,
-            "-i", narration_audio_path,
-            "-i", synced_music_path,
-            "-filter_complex", filter_complex,
-            "-t", str(video_duration),
-            "-c:a", "libmp3lame",
-            "-b:a", "192k",
-            "-ar", "44100",
-            "-ac", "2",
-            "-y",
-            final_audio_path
-        ]
-        
-        try:
-            subprocess.run(cmd_mix, capture_output=True, text=True, check=True, timeout=300)
-            print(f"   [OK] Audio mixed: narration + music")
-        except Exception as e:
-            print(f"   [WARNING] Audio mixing failed: {e}, using narration only")
-            final_audio_path = narration_audio_path
+        else:
+            print("   [WARNING] Could not determine music duration, using original music")
+            synced_music_path = music_source
+        music_for_mux_path = synced_music_path
     else:
-        # No music, use narration only
         print(f"   [WARNING] Music file not found, using narration only")
-        final_audio_path = narration_audio_path
+        music_for_mux_path = None
     
     # Add audio to video
     base, ext = os.path.splitext(video_path)
@@ -5127,16 +5255,20 @@ def ensure_audio_on_video(video_path, ffmpeg_path=None, narration_audio_path=Non
             output_path=video_with_audio_path,
             ffmpeg_path=ffmpeg_path,
             sync_duration=False,  # Audio already synced
-            audio_delay_ms=audio_delay_ms  # Center narration in video
+            audio_delay_ms=audio_delay_ms,  # Center narration in video
+            music_audio_path=music_for_mux_path,  # Music starts at 0s
+            music_volume=music_volume
         )
         print(f"[OK] Audio added to video: {os.path.basename(result_path)}")
         
         # Clean up temp files
         try:
-            if final_audio_path and final_audio_path != narration_audio_path and os.path.exists(final_audio_path):
-                os.remove(final_audio_path)
-            if 'synced_music_path' in locals() and synced_music_path != music_source and os.path.exists(synced_music_path):
-                os.remove(synced_music_path)
+            if (
+                music_for_mux_path
+                and music_for_mux_path != music_source
+                and os.path.exists(music_for_mux_path)
+            ):
+                os.remove(music_for_mux_path)
         except:
             pass
         
@@ -6023,7 +6155,8 @@ def generate_video_segments(
     resolution,
     poll_interval,
     max_wait_time,
-    segments_to_regenerate=None
+    segments_to_regenerate=None,
+    video_prompt=None
 ):
     """
     Generate video segments with Sora. Can generate all segments or regenerate specific ones.
@@ -6044,6 +6177,7 @@ def generate_video_segments(
         poll_interval: Polling interval for status checks
         max_wait_time: Maximum wait time for generation
         segments_to_regenerate: Optional list of segment IDs to regenerate. If None, generates all.
+        video_prompt: Original high-level video topic/prompt for moderation fallback generation.
         
     Returns:
         List of dicts with segment_id, prompt, video_path
@@ -6063,17 +6197,53 @@ def generate_video_segments(
 
     generated_video_segments = []
     video_jobs = []
+
+    def _is_moderation_error(error_obj):
+        if getattr(error_obj, "code", None) == "moderation_blocked":
+            return True
+        error_text = str(error_obj).lower()
+        moderation_markers = [
+            "moderation",
+            "content policy",
+            "policy",
+            "blocked",
+            "safety",
+            "sensitive",
+            "unsafe",
+        ]
+        return any(marker in error_text for marker in moderation_markers)
+
+    def _build_topic_fallback_prompt(topic_text, segment_number):
+        topic = (topic_text or "").strip()
+        if not topic and generated_script:
+            topic = generated_script[:240].strip()
+        if not topic:
+            topic = f"documentary topic segment {segment_number}"
+        if len(topic) > 260:
+            topic = topic[:257].rstrip() + "..."
+        return (
+            "Ultra-photorealistic real-life documentary footage. "
+            f"Simple neutral establishing b-roll of: {topic}. "
+            "Single continuous shot, natural lighting, physically plausible motion, authentic textures, no text overlays, "
+            "no logos, no violence, no sensitive content, absolutely no CGI or stylization."
+        )
+
     # Step 2a: Start all video generation jobs 15 seconds apart (non-blocking)
     print("Starting video generation jobs...")
 
     for video_idx, segment_id in enumerate(video_segment_ids, 1):
-        if segment_id_to_prompt and segment_id in segment_id_to_prompt:
-            segment_prompt = segment_id_to_prompt[segment_id]
-        else:
-            segment_prompt = "A cinematic scene"
+        segment_prompt = None
+        if isinstance(segment_id_to_prompt, dict):
+            # Support both int and str keys so old metadata files remain compatible.
+            segment_prompt = segment_id_to_prompt.get(segment_id)
+            if segment_prompt is None:
+                segment_prompt = segment_id_to_prompt.get(str(segment_id))
+
+        if segment_prompt is None:
+            segment_prompt = "Ultra-photorealistic real-life documentary footage scene captured by a physical camera, with natural lighting and physically plausible motion, absolutely no CGI or stylization"
 
         if not segment_prompt or len(segment_prompt.strip()) == 0:
-            segment_prompt = "A cinematic scene"
+            segment_prompt = "Ultra-photorealistic real-life documentary footage scene captured by a physical camera, with natural lighting and physically plausible motion, absolutely no CGI or stylization"
 
         print(f"Segment {segment_id}/{num_segments} (video {video_idx}/{len(video_segment_ids)}): Text-to-video")
         print(f"  Prompt: {segment_prompt[:100]}...")
@@ -6112,6 +6282,7 @@ def generate_video_segments(
         max_retries = 3
         segment_video_path = None
         last_error = None
+        moderation_blocked_detected = False
 
         for attempt in range(1, max_retries + 1):
             try:
@@ -6155,12 +6326,45 @@ def generate_video_segments(
                 last_error = e
                 error_msg = str(e)
                 error_type = type(e).__name__
+                if _is_moderation_error(e):
+                    moderation_blocked_detected = True
+                    print("   ⚠️  Moderation/content-policy block detected for this segment.")
                 if attempt < max_retries:
                     print(f"   ⚠️  Attempt {attempt} failed ({error_type}): {error_msg[:200]}")
                     print("   Retrying in 5 seconds...")
                     time.sleep(5)
                 else:
                     print(f"   ❌ All {max_retries} attempts failed for segment {segment_id}")
+
+        if segment_video_path is None and moderation_blocked_detected:
+            fallback_prompt = _build_topic_fallback_prompt(video_prompt, segment_id)
+            print("   🛟 Trying lightweight moderation fallback prompt based on video topic...")
+            try:
+                fallback_video_id = start_video_generation_job(
+                    prompt=fallback_prompt,
+                    api_key=api_key,
+                    model=model,
+                    resolution=resolution,
+                    duration=FIXED_SEGMENT_DURATION_INT,
+                )
+                base, ext = os.path.splitext(segment_output_path)
+                fallback_output_path = f"{base}_fallback{ext}"
+                segment_video_path = wait_for_video_completion(
+                    video_id=fallback_video_id,
+                    output_path=fallback_output_path,
+                    api_key=api_key,
+                    poll_interval=poll_interval,
+                    max_wait_time=max_wait_time
+                )
+                generated_video_segments.append({
+                    'segment_id': segment_id,
+                    'prompt': fallback_prompt,
+                    'video_path': segment_video_path
+                })
+                print(f"✅ Segment {segment_id} completed via moderation fallback: {segment_video_path}")
+            except Exception as fallback_error:
+                last_error = fallback_error
+                print(f"   ❌ Moderation fallback failed for segment {segment_id}: {fallback_error}")
 
         if segment_video_path is None:
             raise RuntimeError(
@@ -6356,7 +6560,7 @@ def generate_and_upload_sora(
                     api_key=api_key,
                     max_attempts=3,
                     tolerance_seconds=60,
-                    music_volume=0.08
+                    music_volume=DEFAULT_MUSIC_VOLUME
                 )
                 
                 print(f"✅ Narration generated and saved: {narration_audio_path}")
@@ -6385,7 +6589,7 @@ def generate_and_upload_sora(
                     api_key=api_key,
                     max_attempts=3,
                     tolerance_seconds=60,
-                    music_volume=0.08
+                    music_volume=DEFAULT_MUSIC_VOLUME
                 )
                 print(f"✅ Generated temporary narration for segmentation: {narration_audio_path}")
                 print(f"   Note: Narration will be regenerated in Step 3")
@@ -6498,7 +6702,7 @@ def generate_and_upload_sora(
                     voiceover_audio_path=remix_source,
                     music_audio_path=music_file_path,
                     output_path=narration_audio_path,
-                    music_volume=0.08
+                    music_volume=DEFAULT_MUSIC_VOLUME
                 )
                 print(f"✅ Narration audio remixed with generated music: {narration_audio_path}")
             except Exception as remix_error:
@@ -6652,7 +6856,7 @@ def generate_and_upload_sora(
             total_duration=duration,
             overarching_script=generated_script,
             api_key=api_key,
-            model='gpt-5-2025-08-07',
+            model=SORA_PROMPT_TEXT_MODEL,
             visual_continuity_description=visual_continuity_description,
             narration_offset=narration_offset
         )
@@ -6824,6 +7028,7 @@ def generate_and_upload_sora(
             poll_interval=poll_interval,
             max_wait_time=max_wait_time,
             segments_to_regenerate=None,  # Generate all
+            video_prompt=prompt,
         )
         
         # Save metadata after generation
@@ -6897,6 +7102,7 @@ def generate_and_upload_sora(
                 poll_interval=poll_interval,
                 max_wait_time=max_wait_time,
                 segments_to_regenerate=None,  # Generate all
+                video_prompt=prompt,
             )
             
             # Save metadata AFTER generating videos (for future use)
@@ -7016,6 +7222,7 @@ def generate_and_upload_sora(
                     poll_interval=poll_interval,
                     max_wait_time=max_wait_time,
                     segments_to_regenerate=segments_to_regenerate,
+                    video_prompt=prompt,
                 )
                 
                 # Update generated_video_segments with regenerated ones
@@ -7149,9 +7356,9 @@ def generate_and_upload_sora(
         else:
             add_voiceover = True  # User said yes, so proceed
         
-        # Add audio to stitched video (mix narration + music at 8%)
+        # Add audio to stitched video (music starts at 0s, narration is delayed)
         if add_voiceover and video_path and os.path.exists(video_path) and voiceover_audio_path and os.path.exists(voiceover_audio_path):
-            print("Mixing narration and music, then adding to stitched video...")
+            print("Preparing narration/music for stitched video...")
             
             ffmpeg_path = find_ffmpeg()
             if not ffmpeg_path:
@@ -7191,12 +7398,12 @@ def generate_and_upload_sora(
                 voiceover_duration = get_media_duration(voiceover_source, ffmpeg_path)
                 if voiceover_duration:
                     print(f"   Narration duration: {voiceover_duration:.2f}s (used as-is, no speed adjustment)")
+                music_for_mux_path = None
                 
-                # Now proceed with music mixing
-                # Re-mix audio with proper synchronization:
+                # Prepare separate music for final mux:
                 # 1. Narration is used as-is (no speed adjustment)
                 # 2. Sync music to video duration exactly
-                # 3. Re-mix with voiceover at 8% music volume
+                # 3. Final mux delays narration only; music starts at 0s
                 
                 # Try to re-extract music from VIDEO_MUSIC.mp3 and sync it
                 current_dir = os.getcwd()
@@ -7287,44 +7494,25 @@ def generate_and_upload_sora(
                                             try:
                                                 subprocess.run(cmd_sync, capture_output=True, text=True, check=True)
                                                 voiceover_audio_path = synced_audio_path
+                                                music_for_mux_path = None
                                                 print(f"   ✅ Mixed audio synced to video duration ({video_duration:.2f}s) without doubling music")
                                             except Exception as e:
                                                 print(f"   ⚠️  Audio sync failed: {e}, using original")
                                                 voiceover_audio_path = voiceover_source
+                                                music_for_mux_path = None
                                         else:
                                             # Duration already matches, just use it
                                             voiceover_audio_path = voiceover_source
+                                            music_for_mux_path = None
                                             print(f"   ✅ Mixed audio duration already matches video ({video_duration:.2f}s)")
                                     else:
-                                        # Original voiceover found - safe to add music
-                                        # Mix: voiceover + music (8% volume)
-                                        synced_audio_path = os.path.join(temp_dir, f"audio_resynced_{timestamp}.mp3")
-                                        
-                                        # Mix music and narration together at 8% music volume
-                                        filter_complex = (
-                                            f"[0:a]aresample=44100,volume=1.0[voice];"
-                                            f"[1:a]aresample=44100,volume={0.08}[music];"  # 8% volume for background music
-                                            f"[voice][music]amix=inputs=2:duration=longest:dropout_transition=2,"
-                                            f"volume=2.0"  # Boost volume by 2x after mixing
+                                        # Keep narration and music separate for final mux.
+                                        voiceover_audio_path = voiceover_source
+                                        music_for_mux_path = synced_music_path
+                                        print(
+                                            f"   ✅ Prepared separate narration + music "
+                                            f"({DEFAULT_MUSIC_VOLUME*100:.1f}% music) for final mux"
                                         )
-                                        
-                                        cmd_remix = [
-                                            ffmpeg_path,
-                                            "-i", voiceover_source,
-                                            "-i", synced_music_path,
-                                            "-filter_complex", filter_complex,
-                                            "-t", str(video_duration),
-                                            "-c:a", "libmp3lame",
-                                            "-b:a", "192k",
-                                            "-ar", "44100",
-                                            "-ac", "2",
-                                            "-y",
-                                            synced_audio_path
-                                        ]
-                                        
-                                        subprocess.run(cmd_remix, capture_output=True, text=True, check=True)
-                                        voiceover_audio_path = synced_audio_path
-                                        print(f"   ✅ Audio mixed: narration + music (8% volume) synced to video ({video_duration:.2f}s)")
                                     
                                 except Exception as e:
                                     print(f"   ⚠️  Music re-sync failed: {e}")
@@ -7351,9 +7539,14 @@ def generate_and_upload_sora(
                                     print(f"   ⚠️  Music fade failed: {e}")
                                     print(f"   ⏭️  Skipping music fade - using original music without fade effects")
                                     synced_music_path = music_source
+                                if voiceover_source != voiceover_audio_path:
+                                    voiceover_audio_path = voiceover_source
+                                    music_for_mux_path = synced_music_path
                         else:
-                            print(f"   ⚠️  VIDEO_MUSIC.mp3 not found - cannot mix music separately")
-                            print(f"   Using original mixed audio")
+                            print("   ⚠️  Could not determine music duration - using original music track")
+                            if voiceover_source != voiceover_audio_path:
+                                voiceover_audio_path = voiceover_source
+                                music_for_mux_path = music_source
                 
                 # Add mixed audio to video
                 try:
@@ -7370,9 +7563,14 @@ def generate_and_upload_sora(
                             output_path=video_with_audio_path,
                             ffmpeg_path=ffmpeg_path,
                             sync_duration=False,  # Already synced above
-                            audio_delay_ms=narration_delay_ms  # Center narration in video
+                            audio_delay_ms=narration_delay_ms,  # Center narration in video
+                            music_audio_path=music_for_mux_path,  # Music starts at 0s
+                            music_volume=DEFAULT_MUSIC_VOLUME
                         )
-                        print(f"✅ Video with mixed audio (narration + 8% music): {video_path}")
+                        print(
+                            f"✅ Video with narration + music ({DEFAULT_MUSIC_VOLUME*100:.1f}% music): "
+                            f"{video_path}"
+                        )
                         
                         # Apply ending fade: fade to black and audio fade out over last 2 seconds
                         try:
@@ -8603,6 +8801,7 @@ Environment Variables:
                             poll_interval=args.poll_interval,
                             max_wait_time=args.max_wait,
                             segments_to_regenerate=segments_to_regenerate,
+                            video_prompt=config.get('prompt', ''),
                         )
                         
                         # Update generated_video_segments with regenerated ones
